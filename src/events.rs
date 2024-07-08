@@ -61,7 +61,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if code >= 0 {
+    if code == HC_ACTION as _ {
         let kb_info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         if wparam == WPARAM(WM_KEYDOWN as _) || wparam == WPARAM(WM_SYSKEYDOWN as _) {
             KEY_MAP.set(kb_info.vkCode as _, KeyState::Down);
@@ -72,9 +72,12 @@ unsafe extern "system" fn low_level_keyboard_proc(
 
         if wparam == WPARAM(WM_KEYUP as _) || wparam == WPARAM(WM_SYSKEYUP as _) {
             KEY_MAP.set(kb_info.vkCode as _, KeyState::Up);
-            if SetEvent(*KB_EVENT).is_err() {
-                eprintln!("{:?}", GetLastError());
-            }
+            // Don't send event on keyup.
+        }
+
+        if Key::try_from_vk(kb_info.vkCode as _).unwrap() == Key::AltLeft as _ {
+            println!("here");
+            return LRESULT(1);
         }
     }
 

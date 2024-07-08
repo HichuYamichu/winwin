@@ -1,6 +1,6 @@
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Key {
-    Back = 0,
+    Back,
     Tab,
     Clear,
     Return,
@@ -116,26 +116,6 @@ pub enum Key {
     Comma,
     Minus,
     Period,
-
-    /// Added for Default implementation.
-    None,
-}
-
-impl Default for Key {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl TryFrom<u128> for Key {
-    type Error = ();
-
-    fn try_from(u: u128) -> Result<Self, Self::Error> {
-        match u {
-            _ => Err(())
-        }
-
-    }
 }
 
 impl Key {

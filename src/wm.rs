@@ -1,5 +1,10 @@
+use std::cmp::Ordering;
+
 use allocator_api2::vec::*;
-use windows::{Win32::Foundation::*, Win32::Graphics::Gdi::*, Win32::UI::WindowsAndMessaging::*};
+use windows::{
+    Win32::Foundation::*, Win32::Graphics::Gdi::*, Win32::System::Threading::*,
+    Win32::UI::WindowsAndMessaging::*,
+};
 
 use crate::{Arena, Context};
 
@@ -15,12 +20,13 @@ pub struct Window {
     pub handle: HWND,
 }
 
-
 impl Window {
     pub const NULL_HWND: HWND = HWND(0);
-    pub const NULL: Window = Window { handle: Self::NULL_HWND };
+    pub const NULL: Window = Window {
+        handle: Self::NULL_HWND,
+    };
 
-    pub fn bounding_rect(&self) -> Rect {
+    pub fn rect(&self) -> Rect {
         let mut rect = RECT::default();
         let res = unsafe { GetWindowRect(self.handle, &mut rect as *mut _) };
         match res {
@@ -29,7 +35,7 @@ impl Window {
         }
     }
 
-    pub fn set_bounding_rect(&self, rect: Rect) {
+    pub fn set_rect(&self, rect: Rect) {
         if rect == Rect::default() {
             return;
         }
@@ -48,7 +54,7 @@ impl Window {
     }
 
     pub fn is_on_monitor(&self, monitor: Monitor) -> bool {
-        let wr = self.bounding_rect();
+        let wr = self.rect();
         let intersection = wr.intersection(&monitor.bounding_rect());
 
         let window_area = wr.area();
@@ -58,11 +64,11 @@ impl Window {
         overlap >= 0.5
     }
 
+    // Only for debug purposes.
     pub fn title(&self) -> String {
-        unimplemented!()
-        // let mut buff = [0; 255];
-        // unsafe { GetWindowTextW(self.handle, &mut buff) };
-        // String::from_utf16_lossy(&buff)
+        let mut buff = [0; 255];
+        unsafe { GetWindowTextW(self.handle, &mut buff) };
+        String::from_utf16_lossy(&buff)
     }
 
     pub fn info(&self) -> WindowInfo {
@@ -75,6 +81,18 @@ impl Window {
         assert!(res.is_ok());
 
         todo!()
+    }
+
+    pub fn focus(&self) {
+        unsafe {
+            let currentThreadId = GetCurrentThreadId();
+            let foregroundThreadId = GetWindowThreadProcessId(GetForegroundWindow(), None);
+            AttachThreadInput(currentThreadId, foregroundThreadId, TRUE);
+            BringWindowToTop(self.handle);
+            ShowWindow(self.handle, SW_SHOW);
+            SetForegroundWindow(self.handle);
+            AttachThreadInput(currentThreadId, foregroundThreadId, FALSE);
+        };
     }
 
     pub fn is_null(&self) -> bool {
@@ -148,6 +166,24 @@ impl Rect {
         } else {
             Rect::default()
         }
+    }
+
+    pub fn center(&self) -> Point {
+        let x = self.x + self.width / 2;
+        let y = self.y + self.height / 2;
+        Point { x, y }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl Point {
+    pub fn distance(&self, other: Self) -> i32 {
+        ((self.x - other.x).pow(2) as f32 + (self.y - other.y).pow(2) as f32).sqrt() as i32
     }
 }
 
@@ -290,7 +326,7 @@ fn set_stack_layout(ctx: &Context, monitor: Monitor) {
 
             let mut window_iter = windows.iter();
             let main_window = window_iter.next().expect("there are multiple windows");
-            main_window.set_bounding_rect(main_window_rect);
+            main_window.set_rect(main_window_rect);
 
             let mut sub_window_rect = Rect {
                 x: main_window_rect.x + partition_width,
@@ -300,7 +336,7 @@ fn set_stack_layout(ctx: &Context, monitor: Monitor) {
             };
 
             for window in window_iter {
-                window.set_bounding_rect(sub_window_rect);
+                window.set_rect(sub_window_rect);
                 sub_window_rect.y += partition_height;
             }
         }
@@ -311,4 +347,33 @@ fn set_full_layout(monitor: Monitor) {}
 
 pub fn keep_layout(ctx: &Context, monitor: Monitor, window: Window) {}
 
-pub fn move_focus(ctx: &Context, direction: Direction) {}
+pub fn move_focus(ctx: &Context, direction: Direction) {
+    let origin_window = get_focused_window();
+    let windows = get_all_windows(ctx);
+
+    let origin_rect = origin_window.rect();
+    let origin_center = origin_rect.center();
+
+    let mut candidate_windows = Vec::new_in(&ctx.arena);
+
+    let window_centers = windows.iter().map(|w| (w, w.rect().center()));
+    let windows_in_direction = window_centers
+        .filter(|(_, p)| match direction {
+            Direction::Up => p.y > origin_center.y,
+            Direction::Down => p.y <= origin_center.y,
+            Direction::Left => p.x < origin_center.x,
+            Direction::Right => p.x >= origin_center.x,
+        })
+        .filter(|(w, _)| **w != origin_window);
+
+    candidate_windows.extend(windows_in_direction);
+    candidate_windows.sort_by(|(_, a), (_, b)| {
+        let da = a.distance(origin_center);
+        let db = b.distance(origin_center);
+        da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+    });
+
+    if let Some((target_window, _)) = candidate_windows.get(0) {
+        target_window.focus();
+    }
+}
