@@ -233,6 +233,10 @@ pub fn get_all_windows(ctx: &Context) -> Vec<Window, &Arena> {
     windows
 }
 
+pub fn is_minimised(window: Window) -> bool {
+    unsafe { IsIconic(window.handle).into() }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub struct Monitor {
     handle: HMONITOR,
@@ -349,31 +353,50 @@ pub fn keep_layout(ctx: &Context, monitor: Monitor, window: Window) {}
 
 pub fn move_focus(ctx: &Context, direction: Direction) {
     let origin_window = get_focused_window();
-    let windows = get_all_windows(ctx);
+    let target_window = get_adjacent(ctx, origin_window, direction);
 
-    let origin_rect = origin_window.rect();
+    if let Some(target_window) = target_window {
+        target_window.focus();
+    }
+}
+
+pub fn swap_adjacent(ctx: &Context, window: Window, direction: Direction) {
+    let other = get_adjacent(ctx, window, direction);
+
+    if let Some(other) = other {
+        let base_rect = window.rect();
+        let other_rect = other.rect();
+
+        window.set_rect(other_rect);
+        other.set_rect(base_rect);
+    }
+}
+
+pub fn get_adjacent(ctx: &Context, window: Window, direction: Direction) -> Option<Window> {
+    let windows = get_all_windows(ctx);
+    let origin_rect = window.rect();
     let origin_center = origin_rect.center();
+    dbg!(origin_center);
 
     let mut candidate_windows = Vec::new_in(&ctx.arena);
 
     let window_centers = windows.iter().map(|w| (w, w.rect().center()));
     let windows_in_direction = window_centers
+        .filter(|(w, _)| !is_minimised(**w))
         .filter(|(_, p)| match direction {
             Direction::Up => p.y > origin_center.y,
             Direction::Down => p.y <= origin_center.y,
             Direction::Left => p.x < origin_center.x,
             Direction::Right => p.x >= origin_center.x,
         })
-        .filter(|(w, _)| **w != origin_window);
+        .filter(|(w, _)| **w != window);
 
     candidate_windows.extend(windows_in_direction);
     candidate_windows.sort_by(|(_, a), (_, b)| {
         let da = a.distance(origin_center);
         let db = b.distance(origin_center);
-        da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+        da.cmp(&db)
     });
 
-    if let Some((target_window, _)) = candidate_windows.get(0) {
-        target_window.focus();
-    }
+    candidate_windows.get(0).map(|(w, _)| **w)
 }

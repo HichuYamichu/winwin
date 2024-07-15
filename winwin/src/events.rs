@@ -1,23 +1,33 @@
 use allocator_api2::vec::*;
+use std::ffi::CString;
+use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{mpsc, Mutex};
 use std::{marker::PhantomData, thread};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{Arena, Context, Key, Window, LOCK_WAS_POISONED_MSG};
-use once_cell::sync::Lazy;
+use windows_core::s;
+
+use crate::{Arena, Context, Key, KeyState, Window};
+pub use winwin_common::{InternalEvent, KBDelta, WindowEvent};
+
+#[link(name = "hooks.dll", kind = "dylib")]
+extern "C" {
+    fn init() -> Receiver<InternalEvent>;
+}
+
+#[link(name = "hooks.dll", kind = "dylib")]
+extern "system" {
+    fn cbt_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
+    fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
+}
 
 pub enum Event<'a> {
     KeyPress(Input<'a>),
     WindowOpen(Window),
     WindowClose(Window),
-}
-
-enum InternalEvent {
-    Keyboard(KBDelta, SyncSender<bool>),
 }
 
 pub struct EventQueue {
@@ -28,12 +38,11 @@ pub struct EventQueue {
     _unsync: PhantomData<*const ()>,
 }
 
-static mut INTERNAL_EVENT_SENDER: Option<SyncSender<InternalEvent>> = None;
-
 impl EventQueue {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::sync_channel(0);
-        thread::spawn(|| install_hooks(tx));
+        let rx = unsafe { init() };
+
+        thread::spawn(|| install_hooks());
 
         Self {
             ev_rx: rx,
@@ -54,83 +63,29 @@ impl EventQueue {
                 let input = self.key_map.input(ctx, intercept_tx);
                 Event::KeyPress(input)
             }
-        }
-    }
-}
-
-fn install_hooks(tx: SyncSender<InternalEvent>) {
-    unsafe {
-        INTERNAL_EVENT_SENDER = Some(tx);
-
-        let h_instance =
-            GetModuleHandleA(None).expect("loading handle to current module should always succeed");
-        // TODO: Implement clanup.
-        let _ = SetWindowsHookExA(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), h_instance, 0);
-
-        let _ = GetMessageA(std::ptr::null_mut(), None, 0, 0);
-    }
-}
-
-unsafe extern "system" fn low_level_keyboard_proc(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    if code == HC_ACTION as _ {
-        let kb_info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        let kb_delta = KBDelta {
-            vk_code: kb_info.vkCode as _,
-            key_state: KeyState::from(wparam),
-        };
-
-        if let Some(sender) = INTERNAL_EVENT_SENDER.as_ref() {
-            let (intercept_tx, intercept_rx) = mpsc::sync_channel(0);
-            sender
-                .send(InternalEvent::Keyboard(kb_delta, intercept_tx))
-                .unwrap();
-
-            if let Ok(do_intercept) = intercept_rx.recv() {
-                if do_intercept {
-                    return LRESULT(1);
+            InternalEvent::Shell(kind, handle) => {
+                println!("hell event");
+                let window = Window { handle };
+                match kind {
+                    WindowEvent::Created => Event::WindowOpen(window),
+                    WindowEvent::Destroyed => Event::WindowClose(window),
                 }
             }
         }
     }
-
-    return CallNextHookEx(None, code, wparam, lparam);
 }
 
-struct KBDelta {
-    vk_code: u8,
-    key_state: KeyState,
-}
+fn install_hooks() {
+    unsafe {
+        create_hidden_window();
+        let dll_name = s!("hooks.dll");
+        let h_instance = GetModuleHandleA(dll_name)
+            .expect("loading handle to current module should always succeed");
 
-#[derive(Debug, Copy, Clone)]
-pub enum KeyState {
-    Up,
-    Down,
-}
+        let _ = SetWindowsHookExA(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), h_instance, 0);
+        let _ = SetWindowsHookExA(WH_SHELL, Some(cbt_proc), h_instance, 0).unwrap();
 
-impl From<KeyState> for bool {
-    fn from(ks: KeyState) -> Self {
-        match ks {
-            KeyState::Up => false,
-            KeyState::Down => true,
-        }
-    }
-}
-
-impl From<WPARAM> for KeyState {
-    fn from(wparam: WPARAM) -> Self {
-        if wparam == WPARAM(WM_KEYDOWN as _) || wparam == WPARAM(WM_SYSKEYDOWN as _) {
-            return KeyState::Down;
-        }
-
-        if wparam == WPARAM(WM_KEYUP as _) || wparam == WPARAM(WM_SYSKEYUP as _) {
-            return KeyState::Up;
-        }
-
-        unreachable!();
+        let _ = GetMessageA(std::ptr::null_mut(), None, 0, 0);
     }
 }
 
@@ -198,19 +153,7 @@ impl Input<'_> {
     }
 
     pub fn pressed_no_intercept(&self, key: Key) -> bool {
-        self.keys.iter().any(|it| *it == key)
-    }
-
-    pub fn any_pressed(&self, keys: &[Key]) -> bool {
-        let pressed = self.any_pressed_no_intercept(keys);
-        if pressed {
-            let _ = self.intercept_tx.try_send(true);
-        }
-        pressed
-    }
-
-    pub fn any_pressed_no_intercept(&self, keys: &[Key]) -> bool {
-        keys.iter().any(|it| self.pressed_no_intercept(*it))
+        self.keys[0] == key
     }
 
     pub fn all_pressed(&self, keys: &[Key]) -> bool {
@@ -222,6 +165,47 @@ impl Input<'_> {
     }
 
     pub fn all_pressed_no_intercept(&self, keys: &[Key]) -> bool {
-        keys.iter().all(|it| self.pressed_no_intercept(*it))
+        // Make sure len is the same otherwise we might match different keybind.
+        keys.iter().all(|it| self.keys.iter().any(|k| *k == *it)) && self.keys.len() == keys.len()
     }
+}
+
+unsafe fn create_hidden_window() -> HWND {
+    let class_name = s!("hidden window");
+    let h_instance = GetModuleHandleA(None).unwrap();
+
+    use windows::Win32::UI::WindowsAndMessaging::DefWindowProcA;
+    // let wnd_class = WNDCLASSA {
+    //     style: WNDCLASS_STYLES(0),
+    //     lpfnWndProc: Some(DefWindowProcA),
+    //     cbClsExtra: 0,
+    //     cbWndExtra: 0,
+    //     hInstance: h_instance.into(),
+    //     hIcon: HICON(std::ptr::null_mut() as _),
+    //     hCursor: HCURSOR(std::ptr::null_mut() as _),
+    //     hbrBackground: (std::ptr::null_mut() as _),
+    //     lpszMenuName: s!(""),
+    //     lpszClassName: class_name,
+    // };
+    //
+    // if RegisterClassA(&wnd_class) == 0 {
+    //     panic!("Failed to register window class");
+    // }
+
+    let hwnd = CreateWindowExA(
+        WINDOW_EX_STYLE(0),
+        class_name,
+        None,
+        WINDOW_STYLE(0),
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        h_instance,
+        None,
+    );
+
+    hwnd
 }

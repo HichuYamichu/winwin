@@ -1,3 +1,5 @@
+use windows::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Key {
     Back,
@@ -117,7 +119,7 @@ pub enum Key {
     Minus,
     Period,
 
-    Unknown
+    Unknown,
 }
 
 impl Key {
@@ -241,5 +243,34 @@ impl Key {
             0xBE => Self::Period,
             _ => Self::Unknown,
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum KeyState {
+    Up,
+    Down,
+}
+
+impl From<KeyState> for bool {
+    fn from(ks: KeyState) -> Self {
+        match ks {
+            KeyState::Up => false,
+            KeyState::Down => true,
+        }
+    }
+}
+
+impl From<WPARAM> for KeyState {
+    fn from(wparam: WPARAM) -> Self {
+        if wparam == WPARAM(WM_KEYDOWN as _) || wparam == WPARAM(WM_SYSKEYDOWN as _) {
+            return KeyState::Down;
+        }
+
+        if wparam == WPARAM(WM_KEYUP as _) || wparam == WPARAM(WM_SYSKEYUP as _) {
+            return KeyState::Up;
+        }
+
+        unreachable!();
     }
 }

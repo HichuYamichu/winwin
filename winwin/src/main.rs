@@ -1,7 +1,17 @@
 use winwin::*;
+use winwin_common::*;
+
+#[link(name = "hooks.dll", kind="dylib")]
+extern "C" {
+    fn add(left: usize, right: usize) -> usize;
+}
 
 fn main() {
     println!("Hello, world!");
+
+    unsafe {
+        println!("2+2={}", add(2, 2));
+    }
 
     let mod_key = Key::AltLeft;
     let mut queue = EventQueue::new();
@@ -11,9 +21,10 @@ fn main() {
         let event = queue.next_event(&ctx);
         match event {
             Event::KeyPress(input) => {
+                // Change focused window.
                 if input.all_pressed(&[mod_key, Key::L]) {
                     move_focus(&ctx, Direction::Right);
-                } 
+                }
 
                 if input.all_pressed(&[mod_key, Key::H]) {
                     move_focus(&ctx, Direction::Left);
@@ -27,6 +38,16 @@ fn main() {
                     move_focus(&ctx, Direction::Up);
                 }
 
+                // Swap adjacent windows.
+                if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::L]) {
+                    swap_adjacent(&ctx, get_focused_window(), Direction::Right);
+                }
+
+                if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::H]) {
+                    swap_adjacent(&ctx, get_focused_window(), Direction::Left);
+                }
+
+                // Apply selected layout.
                 if input.all_pressed(&[mod_key, Key::Q]) {
                     apply_layout(&ctx, get_focused_monitor(), Layout::Stack);
                 }
@@ -40,10 +61,13 @@ fn main() {
                 }
             }
             Event::WindowOpen(window) => {
-                let monitor = get_monitor_with_window(window);
-                keep_layout(&ctx, monitor, window);
+                dbg!(window);
+                // let monitor = get_monitor_with_window(window);
+                // keep_layout(&ctx, monitor, window);
             }
-            Event::WindowClose(window) => {}
+            Event::WindowClose(window) => {
+                dbg!(window);
+            }
             _ => {}
         }
     }

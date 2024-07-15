@@ -4,16 +4,13 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::{alloc, ptr::NonNull};
 
-mod keys;
-pub use keys::*;
+pub use winwin_common::{Key, KeyState};
 
 mod events;
 pub use events::*;
 
 mod wm;
 pub use wm::*;
-
-pub const LOCK_WAS_POISONED_MSG: &str = "lock should not be poisoned";
 
 pub struct Context {
     // Arena allocator for temporary (frame) allocations.
