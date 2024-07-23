@@ -198,21 +198,15 @@ pub fn get_focused_window() -> Window {
 pub fn get_all_windows(ctx: &Context) -> Vec<Window, &Arena> {
     extern "system" fn push_visible_window(window: HWND, lparam: LPARAM) -> BOOL {
         unsafe {
-            let mut text: [u16; 512] = [0; 512];
-            let len = GetWindowTextW(window, &mut text);
-            let text = String::from_utf16_lossy(&text[..len as usize]);
+            let len = GetWindowTextLengthW(window);
 
             let mut info = WINDOWINFO {
                 cbSize: core::mem::size_of::<WINDOWINFO>() as u32,
                 ..Default::default()
             };
-            // TODO: Remove this unwrap().
-            GetWindowInfo(window, &mut info).unwrap();
+            let _ = GetWindowInfo(window, &mut info);
 
-            if !text.is_empty()
-                && info.dwStyle.contains(WS_VISIBLE)
-                && !info.dwStyle.contains(WS_POPUP)
-            {
+            if len != 0 && info.dwStyle.contains(WS_VISIBLE) && !info.dwStyle.contains(WS_POPUP) {
                 let dest_vec = lparam.0 as *mut Vec<Window, &Arena>;
                 (*dest_vec).push(Window { handle: window });
             }

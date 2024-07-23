@@ -1,17 +1,8 @@
 use winwin::*;
 use winwin_common::*;
 
-#[link(name = "hooks.dll", kind="dylib")]
-extern "C" {
-    fn add(left: usize, right: usize) -> usize;
-}
-
 fn main() {
     println!("Hello, world!");
-
-    unsafe {
-        println!("2+2={}", add(2, 2));
-    }
 
     let mod_key = Key::AltLeft;
     let mut queue = EventQueue::new();
@@ -61,14 +52,16 @@ fn main() {
                 }
             }
             Event::WindowOpen(window) => {
-                dbg!(window);
+                // dbg!(window);
                 // let monitor = get_monitor_with_window(window);
                 // keep_layout(&ctx, monitor, window);
             }
             Event::WindowClose(window) => {
-                dbg!(window);
+                // dbg!(window);
             }
-            _ => {}
+            Event::Shutdown => {
+                break;
+            }
         }
     }
 }

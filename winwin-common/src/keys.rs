@@ -1,4 +1,5 @@
 use windows::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
+use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Key {
@@ -246,7 +247,7 @@ impl Key {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub enum KeyState {
     Up,
     Down,

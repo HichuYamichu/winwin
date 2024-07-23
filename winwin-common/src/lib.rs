@@ -1,23 +1,31 @@
 use std::sync::mpsc::SyncSender;
+use std::sync::OnceLock;
+use serde::{Serialize, Deserialize};
 
 use windows::Win32::Foundation::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleA;
-use windows::Win32::System::Threading::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
 
 mod keys;
 pub use keys::*;
 
-pub enum InternalEvent {
-    Keyboard(KBDelta, SyncSender<bool>),
-    Shell(WindowEvent, HWND),
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ServerCommand {
+    InterceptKeypress,
+    None
 }
 
-pub enum WindowEvent {
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ClientEvent {
+    CBT(usize, WindowEventKind),
+    Keyboard(KBDelta),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum WindowEventKind {
     Created,
     Destroyed,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct KBDelta {
     pub vk_code: u8,
     pub key_state: KeyState,
@@ -51,12 +59,16 @@ impl Logger {
     }
 }
 
-use std::sync::OnceLock;
-
 #[macro_export]
 macro_rules! log {
     ($logger:expr, $($arg:tt)*) => {
         $logger.log(format_args!($($arg)*));
     };
 }
+
+pub fn init_logger() -> Logger {
+    Logger::new("C:\\winwin\\winwin.log")
+}
+
+pub static LOGGER: OnceLock<Logger> = OnceLock::new();
 
