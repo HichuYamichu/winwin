@@ -1,3 +1,4 @@
+use tracing::Level;
 use winwin::*;
 
 fn main() {
@@ -9,6 +10,7 @@ fn main() {
         .with_line_number(true)
         .with_thread_ids(true)
         .with_target(false)
+        .with_max_level(Level::TRACE)
         .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
@@ -65,11 +67,11 @@ fn main() {
                 }
             }
             Event::WindowOpen(window, /*monitor*/ rect) => {
-                dbg!(window, rect);
+                // dbg!(window, rect);
                 // keep_layout(&ctx, monitor, window, rect);
             }
             Event::WindowClose(window) => {
-                dbg!(window);
+                // dbg!(window);
             }
             Event::Shutdown => {
                 break;

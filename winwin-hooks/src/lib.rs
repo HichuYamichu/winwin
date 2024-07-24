@@ -133,14 +133,14 @@ unsafe fn send_event(event: ClientEvent) -> Result<ServerCommand, HookError> {
     };
 
     let mut buffer = [0u8; BUFFER_SIZE];
-    bincode::serialize_into(buffer.as_mut_slice(), &event)?;
-    // let write_buffer = bincode::serialize(&event)?;
+    // bincode::serialize_into(buffer.as_mut_slice(), &event)?;
+    let write_buffer = bincode::serialize(&event)?;
     let mut bytes_written = 0;
 
     unsafe {
         WriteFile(
             pipe,
-            Some(buffer.as_slice()),
+            Some(write_buffer.as_slice()),
             Some(&mut bytes_written),
             None,
         )?;

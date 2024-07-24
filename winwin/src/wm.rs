@@ -285,7 +285,6 @@ pub fn get_adjacent(ctx: &Context, window: Window, direction: Direction) -> Opti
     let windows = get_all_windows(ctx);
     let origin_rect = window.rect();
     let origin_center = origin_rect.center();
-    dbg!(origin_center);
 
     let mut candidate_windows = Vec::new_in(&ctx.arena);
 

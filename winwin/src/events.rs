@@ -1,12 +1,10 @@
 use allocator_api2::vec::*;
 use core::slice;
 use std::alloc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, sync_channel};
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::thread;
 use std::thread::JoinHandle;
-use std::thread::Thread;
+use std::thread::{self};
 use windows::Win32::Foundation::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
@@ -15,9 +13,6 @@ use windows::Win32::System::Threading::*;
 use windows::Win32::System::IO::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use winwin_common::{ClientEvent, Rect, ServerCommand, SyncHandle};
-
-use crossbeam::atomic::AtomicCell;
-use crossbeam::queue::ArrayQueue;
 
 use windows::core::{s, PCSTR};
 
@@ -120,10 +115,6 @@ impl EventQueue {
             let _ = CloseHandle(self.iocp_handle);
         }
 
-        // self.shutdown_tx
-        //     .send(())
-        //     .expect("listening thread should be around at this point");
-
         for h in self.join_handles {
             let _ = h.join();
         }
@@ -146,32 +137,25 @@ unsafe fn install_hooks(thread_id_tx: SyncSender<u32>) {
     let mut msg = MSG::default();
     let _ = GetMessageA(&mut msg as *mut _, None, 0, 0);
 
-    tracing::trace!("hooks unloaded");
-
     let _ = UnhookWindowsHookEx(kb_hook);
     let _ = UnhookWindowsHookEx(cbt_hook);
+
+    tracing::trace!("hooks unloaded");
 }
 
 unsafe fn install_pipe_server(
     tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
     iocp: SyncHandle,
 ) {
-    let pool = IoDataPool::new(10, *iocp);
-
-    thread::scope(|s| {
-        for _ in 0..THREAD_POOL_SIZE {
-            let tx = tx.clone();
-            s.spawn(|| unsafe { handle_pipe_client(iocp, &pool, tx) });
-        }
-        accept_pipe_connections(&pool);
-    });
+    let mut pool = IocpWorkerPool::new(iocp, tx);
+    pool.start_workers_and_accept_connections();
 }
 
-unsafe fn handle_pipe_client(
+unsafe fn handle_iocp(
     iocp: SyncHandle,
-    pool: &IoDataPool,
-    tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
-) -> windows::core::Result<()> {
+    io_objects_release_channel: SyncSender<usize>,
+    event_tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
+) {
     let mut completion_key = 0;
     let mut bytes_transferred = 0;
     let mut overlapped = std::ptr::null_mut();
@@ -189,12 +173,13 @@ unsafe fn handle_pipe_client(
             if e == ERROR_ABANDONED_WAIT_0.into() || e == ERROR_INVALID_HANDLE.into() {
                 // Thread pool is shutting down we need to quit.
                 tracing::trace!("thread pool worker quit");
-                pool.shutdown();
                 break;
             } else if e == ERROR_BROKEN_PIPE.into() && !overlapped.is_null() {
                 // Client disconnected, release this `io_data` and continue.
-                let io_data = &mut *(overlapped as *mut IoData);
-                pool.release(io_data);
+                let io_data = overlapped as usize;
+                io_objects_release_channel
+                    .send(io_data)
+                    .expect("pool never quits before workers");
             } else {
                 // Unexpected error.
                 tracing::warn!(?e);
@@ -212,7 +197,9 @@ unsafe fn handle_pipe_client(
                     Ok(_) => io_data.state = State::ReadEnqueued,
                     Err(e) => {
                         tracing::debug!(?e);
-                        pool.release(io_data);
+                        io_objects_release_channel
+                            .send(io_data.as_usize())
+                            .expect("pool never quits before workers");
                     }
                 }
             }
@@ -220,17 +207,21 @@ unsafe fn handle_pipe_client(
                 let client_message: ClientEvent =
                     bincode::deserialize(&io_data.buffer[..bytes_transferred as usize]).unwrap();
                 let (command_tx, command_rx) = mpsc::sync_channel(0);
-                tx.send((client_message, command_tx))
+                event_tx
+                    .send((client_message, command_tx))
                     .expect("other end should not quit before this thread");
 
                 let command = command_rx.recv().unwrap();
-                bincode::serialize_into(&mut io_data.buffer[..], &command).unwrap();
+                // bincode::serialize_into(&mut io_data.buffer[..], &command).unwrap();
+                let buff = bincode::serialize(&command).unwrap();
 
-                match enqueue_pipe_write(io_data) {
+                match enqueue_pipe_write(io_data, &buff) {
                     Ok(_) => io_data.state = State::WriteEnqueued,
                     Err(e) => {
                         tracing::warn!(?e);
-                        pool.release(io_data);
+                        io_objects_release_channel
+                            .send(io_data.as_usize())
+                            .expect("pool never quits before workers");
                     }
                 }
             }
@@ -238,9 +229,13 @@ unsafe fn handle_pipe_client(
                 // Enqueue dummy read so that client disconnection triggers iocp.
                 match enqueue_pipe_read(io_data) {
                     Ok(_) => io_data.state = State::WaitingForDisconnect,
-                    Err(e) => {
-                        tracing::debug!(?e);
-                        pool.release(io_data);
+                    Err(_) => {
+                        // NOTE: We ignore this error since this is a dummy read.
+                        // If client released their handle already we get here.
+                        // If not then `GetQueuedCompletionStatus` will catch that.
+                        io_objects_release_channel
+                            .send(io_data.as_usize())
+                            .expect("pool never quits before workers");
                     }
                 }
             }
@@ -249,8 +244,6 @@ unsafe fn handle_pipe_client(
             }
         }
     }
-
-    Ok(())
 }
 
 unsafe fn enqueue_pipe_read(io_data: &mut IoData) -> windows::core::Result<()> {
@@ -270,10 +263,10 @@ unsafe fn enqueue_pipe_read(io_data: &mut IoData) -> windows::core::Result<()> {
     Ok(())
 }
 
-unsafe fn enqueue_pipe_write(io_data: &mut IoData) -> windows::core::Result<()> {
+unsafe fn enqueue_pipe_write(io_data: &mut IoData, buff: &[u8]) -> windows::core::Result<()> {
     let res = WriteFile(
         io_data.pipe,
-        Some(&io_data.buffer[..]),
+        Some(buff),
         None,
         Some(&mut io_data.overlapped as *mut _),
     );
@@ -285,28 +278,6 @@ unsafe fn enqueue_pipe_write(io_data: &mut IoData) -> windows::core::Result<()> 
     }
 
     Ok(())
-}
-
-fn accept_pipe_connections(pool: &IoDataPool) {
-    loop {
-        unsafe {
-            match pool.get() {
-                Ok(io_data) => {
-                    let pipe = (*io_data).pipe;
-                    let overlapped = &mut (*io_data).overlapped as *mut _;
-                    if let Err(e) = ConnectNamedPipe(pipe, Some(overlapped)) {
-                        if e != ERROR_IO_PENDING.into() {
-                            tracing::warn!(?e);
-                        }
-                    }
-                }
-                Err(_) => {
-                    // We are shutting down.
-                    break;
-                }
-            }
-        };
-    }
 }
 
 fn create_io_completion_port() -> SyncHandle {
@@ -334,6 +305,10 @@ impl IoData {
             (*io_data).state = State::WaitingForConnection;
         }
     }
+
+    unsafe fn as_usize(&mut self) -> usize {
+        self as *mut _ as _
+    }
 }
 
 impl Default for IoData {
@@ -355,24 +330,33 @@ enum State {
     WaitingForDisconnect,
 }
 
-struct IoDataPool {
-    queue: ArrayQueue<usize>,
-    sleeper: AtomicCell<Option<Thread>>,
+struct IocpWorkerPool {
+    event_tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
+    io_objects_pool: Receiver<usize>,
+    io_objects_release_channel: Option<SyncSender<usize>>,
 
     // Alias to allocation holding all `IoData` objects. It is accessed only in drop impl and thus
     // is safe because drop is guaranteed to be run exclusively by one thread.
-    alloc_alias: usize,
-    size: usize,
-    shutting_down: AtomicBool,
+    allocation: usize,
+    pipe_instance_count: usize,
+    iocp: SyncHandle,
 }
 
-impl IoDataPool {
-    fn new(size: usize, iocp: HANDLE) -> Self {
-        let queue = ArrayQueue::new(size);
+impl IocpWorkerPool {
+    fn new(
+        iocp: SyncHandle,
+        event_tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
+    ) -> Self {
+        let pipe_instance_count = 10 * THREAD_POOL_SIZE;
+        let (io_objects_tx, io_objects_rx) = sync_channel(pipe_instance_count);
 
-        let layout = alloc::Layout::array::<IoData>(size).expect("arguments are correct");
-        let mem = unsafe { alloc::alloc(layout) };
-        let slice = unsafe { slice::from_raw_parts_mut::<IoData>(mem as *mut _, size) };
+        let (allocation, slice) = unsafe {
+            let layout =
+                alloc::Layout::array::<IoData>(pipe_instance_count).expect("arguments are correct");
+            let mem = alloc::alloc_zeroed(layout);
+            let s = slice::from_raw_parts_mut::<IoData>(mem as *mut _, pipe_instance_count);
+            (mem as usize, s)
+        };
 
         for slot in slice.iter_mut() {
             let pipe = unsafe {
@@ -393,74 +377,70 @@ impl IoDataPool {
             let io_data_ptr = slot as *mut _;
 
             unsafe {
-                CreateIoCompletionPort(pipe, iocp, io_data_ptr as usize, 0).unwrap();
+                CreateIoCompletionPort(pipe, *iocp, io_data_ptr as usize, 0).unwrap();
             }
 
-            queue
-                .push(io_data_ptr as _)
+            io_objects_tx
+                .send(io_data_ptr as _)
                 .expect("queue is big enough to hold every io_data");
         }
 
         Self {
-            queue,
-            sleeper: AtomicCell::new(None),
+            event_tx,
+            io_objects_pool: io_objects_rx,
+            io_objects_release_channel: Some(io_objects_tx),
 
-            alloc_alias: mem as _,
-            size,
-            shutting_down: AtomicBool::new(false),
+            allocation,
+            iocp,
+            pipe_instance_count,
         }
     }
 
-    // SAFETY: `get` can only by called by one thread.
-    unsafe fn get(&self) -> Result<*mut IoData, ()> {
-        loop {
-            // We were woken up to singnal a shutdown.
-            if self.shutting_down.load(Ordering::Relaxed) {
-                return Err(());
+    fn start_workers_and_accept_connections(&mut self) {
+        let io_objects_release_channel = self
+            .io_objects_release_channel
+            .take()
+            .expect("channel was initialized");
+        thread::scope(|s| {
+            for _ in 0..THREAD_POOL_SIZE {
+                let event_tx = self.event_tx.clone();
+                let release_channel = io_objects_release_channel.clone();
+                let iocp = self.iocp;
+                s.spawn(move || unsafe { handle_iocp(iocp, release_channel, event_tx) });
             }
 
-            match self.queue.pop() {
-                Some(data) => return Ok(data as *mut _),
-                None => {
-                    let thread_id = thread::current();
-                    self.sleeper.store(Some(thread_id));
-                    thread::park();
+            drop(io_objects_release_channel);
+
+            while let Some(io_data) = self.io_objects_pool.iter().next() {
+                unsafe {
+                    let io_data = &mut *(io_data as *mut IoData);
+                    IoData::reset(io_data);
+                    let pipe = io_data.pipe;
+                    let overlapped = &mut io_data.overlapped as *mut _;
+                    if let Err(e) = ConnectNamedPipe(pipe, Some(overlapped)) {
+                        if e != ERROR_IO_PENDING.into() {
+                            tracing::warn!(?e);
+                        }
+                    }
                 }
             }
-        }
-    }
-
-    fn release(&self, io_data: *mut IoData) {
-        IoData::reset(io_data);
-        self.queue
-            .push(io_data as _)
-            .expect("number of io_data objects is fixed thus this always succeeds");
-        if let Some(sleeper) = self.sleeper.swap(None) {
-            sleeper.unpark();
-        }
-    }
-
-    fn shutdown(&self) {
-        if !self.shutting_down.swap(true, Ordering::Relaxed) {
-            // Unpark listener thread. I will signal that pool is shutting down to the caller.
-            if let Some(sleeper) = self.sleeper.swap(None) {
-                sleeper.unpark();
-            }
-        }
+        });
     }
 }
 
-impl Drop for IoDataPool {
+impl Drop for IocpWorkerPool {
     fn drop(&mut self) {
         tracing::trace!("pool dropped");
-        let slice =
-            unsafe { slice::from_raw_parts_mut::<IoData>(self.alloc_alias as *mut _, self.size) };
+        let slice = unsafe {
+            slice::from_raw_parts_mut::<IoData>(self.allocation as *mut _, self.pipe_instance_count)
+        };
         for io_data in slice {
             let _ = unsafe { CloseHandle(io_data.pipe) };
         }
 
-        let layout = alloc::Layout::array::<IoData>(self.size).expect("arguments are correct");
-        unsafe { alloc::dealloc(self.alloc_alias as *mut _, layout) };
+        let layout = alloc::Layout::array::<IoData>(self.pipe_instance_count)
+            .expect("arguments are correct");
+        unsafe { alloc::dealloc(self.allocation as *mut _, layout) };
     }
 }
 
