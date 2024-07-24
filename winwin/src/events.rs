@@ -12,18 +12,18 @@ use windows::Win32::System::Pipes::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::System::IO::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use winwin_common::{ClientEvent, ServerCommand};
+use winwin_common::{ClientEvent, Rect, ServerCommand, SyncHandle};
 
 use crossbeam::atomic::AtomicCell;
 use crossbeam::queue::ArrayQueue;
 
-use windows_core::{s, PCSTR};
+use windows::core::{s, PCSTR};
 
 use crate::{Arena, Context, Key, KeyState, Window};
-pub use winwin_common::{KBDelta, WindowEventKind};
+pub use winwin_common::KBDelta;
 
 const THREAD_POOL_SIZE: usize = 2;
-const BUFFER_SIZE: usize = 512;
+const BUFFER_SIZE: usize = 1024;
 const PIPE_NAME: PCSTR = s!("\\\\.\\pipe\\winwin_pipe");
 
 #[link(name = "hooks.dll", kind = "dylib")]
@@ -34,7 +34,7 @@ extern "system" {
 
 pub enum Event<'a> {
     KeyPress(Input<'a>),
-    WindowOpen(Window),
+    WindowOpen(Window, Rect),
     WindowClose(Window),
     Shutdown,
 }
@@ -69,17 +69,27 @@ impl EventQueue {
                 let input = self.key_map.input(ctx, command_tx);
                 Event::KeyPress(input)
             }
-            ClientEvent::CBT(handle, kind) => {
+            ClientEvent::WindowOpen(handle, rect) => {
                 command_tx
                     .send(ServerCommand::None)
                     .expect("Rx must be around");
+
                 let window = Window {
                     handle: HWND(handle as _),
                 };
-                match kind {
-                    WindowEventKind::Created => Event::WindowOpen(window),
-                    WindowEventKind::Destroyed => Event::WindowClose(window),
-                }
+
+                Event::WindowOpen(window, rect)
+            }
+            ClientEvent::WindowClose(handle) => {
+                command_tx
+                    .send(ServerCommand::None)
+                    .expect("Rx must be around");
+
+                let window = Window {
+                    handle: HWND(handle as _),
+                };
+
+                Event::WindowClose(window)
             }
         }
     }
@@ -89,8 +99,9 @@ unsafe fn install_pipe_server(tx: SyncSender<(ClientEvent, SyncSender<ServerComm
     let iocp = unsafe {
         CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, THREAD_POOL_SIZE as _).unwrap()
     };
+    let iocp = SyncHandle(iocp);
 
-    let pool = IoDataPool::new(10 * THREAD_POOL_SIZE, iocp);
+    let pool = IoDataPool::new(10, *iocp);
 
     thread::scope(|s| {
         for _ in 0..THREAD_POOL_SIZE {
@@ -107,7 +118,7 @@ unsafe fn install_pipe_server(tx: SyncSender<(ClientEvent, SyncSender<ServerComm
 }
 
 unsafe fn handle_pipe_client(
-    iocp: HANDLE,
+    iocp: SyncHandle,
     pool: &IoDataPool,
     tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
 ) -> windows::core::Result<()> {
@@ -117,7 +128,7 @@ unsafe fn handle_pipe_client(
 
     loop {
         let result = GetQueuedCompletionStatus(
-            iocp,
+            iocp.0,
             &mut bytes_transferred,
             &mut completion_key,
             &mut overlapped,
@@ -125,6 +136,7 @@ unsafe fn handle_pipe_client(
         );
 
         if result.is_err() {
+            tracing::trace!(?result);
             if !overlapped.is_null() {
                 let io_data = &mut *(overlapped as *mut IoData);
                 pool.release(io_data);
@@ -148,9 +160,10 @@ unsafe fn handle_pipe_client(
             State::ReadEnqueued => {
                 let client_message: ClientEvent =
                     bincode::deserialize(&io_data.buffer[..bytes_transferred as usize]).unwrap();
+                // tracing::info!(?client_message);
                 let (command_tx, command_rx) = mpsc::sync_channel(0);
                 tx.send((client_message, command_tx))
-                    .expect("other end should not quit befor this thread");
+                    .expect("other end should not quit before this thread");
 
                 let command = command_rx.recv().unwrap();
                 bincode::serialize_into(&mut io_data.buffer[..], &command).unwrap();
@@ -158,7 +171,7 @@ unsafe fn handle_pipe_client(
                 match enqueue_pipe_write(io_data) {
                     Ok(_) => io_data.state = State::WriteEnqueued,
                     Err(e) => {
-                        tracing::debug!(?e);
+                        tracing::warn!(?e);
                         pool.release(io_data);
                     }
                 }
@@ -222,7 +235,11 @@ fn accept_pipe_connections(pool: &IoDataPool) {
             let io_data = pool.get();
             let pipe = (*io_data).pipe;
             let overlapped = &mut (*io_data).overlapped as *mut _;
-            let _ = ConnectNamedPipe(pipe, Some(overlapped));
+            if let Err(e) = ConnectNamedPipe(pipe, Some(overlapped)) {
+                if e != ERROR_IO_PENDING.into() {
+                    tracing::warn!(?e);
+                }
+            }
         };
     }
 }

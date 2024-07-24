@@ -1,28 +1,39 @@
-use std::sync::mpsc::SyncSender;
-use std::sync::OnceLock;
-use serde::{Serialize, Deserialize};
+use std::{ops::Deref};
 
-use windows::Win32::Foundation::*;
+use serde::{Deserialize, Serialize};
+
+use windows::Win32::{Foundation::{HANDLE, RECT}, UI::WindowsAndMessaging::CREATESTRUCTA};
 
 mod keys;
 pub use keys::*;
 
+/// This HANDLE must be safe to use from multiple threads.
+#[derive(Copy, Clone, Debug)]
+pub struct SyncHandle(pub HANDLE);
+
+unsafe impl Sync for SyncHandle {}
+unsafe impl Send for SyncHandle {}
+
+impl Deref for SyncHandle {
+    type Target = HANDLE;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerCommand {
     InterceptKeypress,
-    None
+    ChangeWindowRect(Rect),
+    None,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientEvent {
-    CBT(usize, WindowEventKind),
+    WindowOpen(usize, Rect),
+    WindowClose(usize),
     Keyboard(KBDelta),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum WindowEventKind {
-    Created,
-    Destroyed,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,44 +42,99 @@ pub struct KBDelta {
     pub key_state: KeyState,
 }
 
-use std::fmt::Arguments;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::sync::Mutex;
+pub struct WindowCrateData {}
 
-pub struct Logger {
-    file: Mutex<std::fs::File>,
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
-impl Logger {
-    pub fn new(log_file: &str) -> Logger {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_file)
-            .expect("Unable to open log file");
+impl Default for Rect {
+    fn default() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        }
+    }
+}
 
-        Logger {
-            file: Mutex::new(file),
+impl From<RECT> for Rect {
+    fn from(r: RECT) -> Self {
+        Self {
+            x: r.left,
+            y: r.top,
+            width: r.right - r.left,
+            height: r.bottom - r.top,
+        }
+    }
+}
+
+impl From<CREATESTRUCTA> for Rect {
+    fn from(value: CREATESTRUCTA) -> Self {
+        Self {
+            x: value.x,
+            y: value.y,
+            width: value.cx,
+            height: value.cy,
+        }
+    }
+}
+
+impl Into<RECT> for Rect {
+    fn into(self) -> RECT {
+        RECT {
+            top: self.y,
+            left: self.x,
+            bottom: self.y + self.height,
+            right: self.x + self.width,
+        }
+    }
+}
+
+impl Rect {
+    #[inline]
+    pub fn area(&self) -> i32 {
+        self.width * self.height
+    }
+
+    pub fn intersection(&self, other: &Self) -> Self {
+        let x1 = self.x.max(other.x);
+        let y1 = self.y.max(other.y);
+        let x2 = (self.x + self.width).min(other.x + other.width);
+        let y2 = (self.y + self.height).min(other.y + other.height);
+
+        if x1 < x2 && y1 < y2 {
+            Self {
+                x: x1,
+                y: y1,
+                width: x2 - x1,
+                height: y2 - y1,
+            }
+        } else {
+            Rect::default()
         }
     }
 
-    pub fn log(&self, args: Arguments) {
-        let mut file = self.file.lock().unwrap();
-        writeln!(file, "{}", args).expect("Unable to write to log file");
+    pub fn center(&self) -> Point {
+        let x = self.x + self.width / 2;
+        let y = self.y + self.height / 2;
+        Point { x, y }
     }
 }
 
-#[macro_export]
-macro_rules! log {
-    ($logger:expr, $($arg:tt)*) => {
-        $logger.log(format_args!($($arg)*));
-    };
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
 }
 
-pub fn init_logger() -> Logger {
-    Logger::new("C:\\winwin\\winwin.log")
+impl Point {
+    pub fn distance(&self, other: Self) -> i32 {
+        ((self.x - other.x).pow(2) as f32 + (self.y - other.y).pow(2) as f32).sqrt() as i32
+    }
 }
-
-pub static LOGGER: OnceLock<Logger> = OnceLock::new();
-

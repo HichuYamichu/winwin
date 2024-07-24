@@ -1,23 +1,42 @@
 use std::sync::Once;
+use windows::core::{s, PCSTR};
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Pipes::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows_core::HRESULT;
-use windows_core::{s, PCSTR};
 
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::fmt::Subscriber;
 
-use winwin_common::{init_logger, log, ClientEvent, ServerCommand, WindowEventKind, LOGGER};
+use winwin_common::{ClientEvent, Rect, ServerCommand};
 
 const PIPE_NAME: PCSTR = s!("\\\\.\\pipe\\winwin_pipe");
 const BUFFER_SIZE: usize = 512;
 
-static TRACING: Once = Once::new();
-
 // Panicking in context of another process is an absolute no-go. All calls have to handle errors.
+
+#[no_mangle]
+#[allow(non_snake_case, unused_variables)]
+extern "system" fn DllMain(dll_module: HINSTANCE, call_reason: u32, _: *mut ()) -> bool {
+    // TODO: Threads are racing to this log file.
+    match call_reason {
+        DLL_PROCESS_ATTACH => {
+            let file_appender =
+                RollingFileAppender::new(Rotation::DAILY, "C:\\winwin", "log_file.log");
+            let subscriber = Subscriber::builder()
+                .with_ansi(false)
+                .with_writer(file_appender)
+                .finish();
+
+            // There's nothing we can do if this fails.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        }
+    }
+
+    true
+}
 
 #[derive(Debug)]
 enum HookError {
@@ -40,29 +59,35 @@ impl From<bincode::Error> for HookError {
 
 #[no_mangle]
 pub unsafe extern "system" fn cbt_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    TRACING.call_once(init_tracing);
-
     if code == HCBT_CREATEWND as _ {
         let hwnd = HWND(wparam.0 as _);
-        let event = ClientEvent::CBT(hwnd.0 as _, WindowEventKind::Created);
-        if let Err(e) = send_event(event) {
-            tracing::warn!(?e);
-        }
+        let create_wnd = &*(lparam.0 as *const CBT_CREATEWNDA);
+        let creation_params = &*create_wnd.lpcs;
+        let rect = Rect::from(*creation_params);
 
-        if is_real_window(hwnd) {}
+        if is_real_window(hwnd, creation_params) {
+            let event = ClientEvent::WindowOpen(hwnd.0 as _, rect);
+            if let Err(e) = send_event(event) {
+                tracing::warn!(?e);
+            }
+        }
     }
 
     if code == HCBT_DESTROYWND as _ {
-        let hwnd = HWND(wparam.0 as _);
-        let event = ClientEvent::CBT(hwnd.0 as _, WindowEventKind::Destroyed);
-        if let Err(e) = send_event(event) {
-            tracing::warn!(?e);
-        }
+        // let hwnd = HWND(wparam.0 as _);
+
+        // if is_real_window(hwnd, params) {
+        //     let event = ClientEvent::WindowClose(hwnd.0 as _);
+        //     if let Err(e) = send_event(event) {
+        //         tracing::warn!(?e);
+        //     }
+        // }
     }
 
     return CallNextHookEx(None, code, wparam, lparam);
 }
 
+// This hook is called in context of main `winwin` process.
 #[no_mangle]
 unsafe extern "system" fn low_level_keyboard_proc(
     code: i32,
@@ -96,6 +121,7 @@ unsafe fn send_event(event: ClientEvent) -> Result<ServerCommand, HookError> {
 
     let mut buffer = [0u8; BUFFER_SIZE];
     bincode::serialize_into(buffer.as_mut_slice(), &event)?;
+    // let write_buffer = bincode::serialize(&event)?;
     let mut bytes_written = 0;
 
     unsafe {
@@ -119,25 +145,56 @@ unsafe fn send_event(event: ClientEvent) -> Result<ServerCommand, HookError> {
     Ok(server_command)
 }
 
-fn is_real_window(handle: HWND) -> bool {
-    unsafe {
-        let len = GetWindowTextLengthW(handle);
+fn is_real_window(_handle: HWND, params: &CREATESTRUCTA) -> bool {
+    // let style = params.style;
+    // let ex_style = params.dwExStyle;
 
-        let mut info = WINDOWINFO {
-            cbSize: core::mem::size_of::<WINDOWINFO>() as u32,
-            ..Default::default()
-        };
-        let _ = GetWindowInfo(handle, &mut info);
-        tracing::info!(len, ?info.dwStyle);
-
-        len != 0 && info.dwStyle.contains(WS_VISIBLE) && !info.dwStyle.contains(WS_POPUP)
+    let this_rect = Rect::from(*params);
+    if this_rect.x == i32::MAX
+        || this_rect.y == i32::MAX
+        || this_rect.width == i32::MAX
+        || this_rect.height == i32::MAX
+        || this_rect.x == i32::MIN
+        || this_rect.y == i32::MIN
+        || this_rect.width == i32::MIN
+        || this_rect.height == i32::MIN
+        || this_rect.width == 0
+        || this_rect.height == 0
+    {
+        return false;
     }
-}
 
-fn init_tracing() {
-    let file_appender = RollingFileAppender::new(Rotation::DAILY, "C:\\winwin", "log_file.log");
-    let subscriber = Subscriber::builder().with_writer(file_appender).finish();
+    if !params.hwndParent.is_invalid() && params.hwndParent != HWND_MESSAGE {
+        return false;
+    }
+    //
+    // if (style & WS_CHILD.0 as i32 != 0) || (style & WS_VISIBLE.0 as i32 == 0) {
+    //     return false;
+    // }
+    //
+    // if (ex_style & WS_EX_TOOLWINDOW).0 != 0 {
+    //     return false;
+    // }
+    //
+    // if !params.lpszClass.is_null() {
+    //     if params.lpszClass.0 as usize & 0xFFFF == params.lpszClass.0 as usize {
+    //         if params.lpszClass.0 as usize == 32768 {
+    //             return false;
+    //         }
+    //     } else {
+    //         let class_name = params.lpszClass;
+    //         if class_name == s!("ToolbarWindow32")
+    //             || class_name == s!("ComboBox")
+    //             || class_name == s!("msctls_progress32")
+    //         {
+    //             return false;
+    //         }
+    //     }
+    // }
+    //
+    // if params.cx <= 0 || params.cy <= 0 {
+    //     return false;
+    // }
 
-    // There's nothing we can do if this fails.
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    true
 }

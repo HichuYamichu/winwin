@@ -1,10 +1,9 @@
-use std::cmp::Ordering;
-
 use allocator_api2::vec::*;
 use windows::{
     Win32::Foundation::*, Win32::Graphics::Gdi::*, Win32::System::Threading::*,
     Win32::UI::WindowsAndMessaging::*,
 };
+use winwin_common::Rect;
 
 use crate::{Arena, Context};
 
@@ -21,7 +20,7 @@ pub struct Window {
 }
 
 impl Window {
-    pub const NULL_HWND: HWND = HWND(0);
+    pub const NULL_HWND: HWND = HWND(std::ptr::null_mut());
     pub const NULL: Window = Window {
         handle: Self::NULL_HWND,
     };
@@ -85,13 +84,13 @@ impl Window {
 
     pub fn focus(&self) {
         unsafe {
-            let currentThreadId = GetCurrentThreadId();
-            let foregroundThreadId = GetWindowThreadProcessId(GetForegroundWindow(), None);
-            AttachThreadInput(currentThreadId, foregroundThreadId, TRUE);
-            BringWindowToTop(self.handle);
-            ShowWindow(self.handle, SW_SHOW);
-            SetForegroundWindow(self.handle);
-            AttachThreadInput(currentThreadId, foregroundThreadId, FALSE);
+            let current_thread_id = GetCurrentThreadId();
+            let foreground_thread_id = GetWindowThreadProcessId(GetForegroundWindow(), None);
+            let _ = AttachThreadInput(current_thread_id, foreground_thread_id, TRUE);
+            let _ = BringWindowToTop(self.handle);
+            let _ = ShowWindow(self.handle, SW_SHOW);
+            let _ = SetForegroundWindow(self.handle);
+            let _ = AttachThreadInput(current_thread_id, foreground_thread_id, FALSE);
         };
     }
 
@@ -102,90 +101,6 @@ impl Window {
 
 #[derive(Debug)]
 pub struct WindowInfo {}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Rect {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-}
-
-impl Default for Rect {
-    fn default() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-        }
-    }
-}
-
-impl From<RECT> for Rect {
-    fn from(r: RECT) -> Self {
-        Self {
-            x: r.left,
-            y: r.top,
-            width: r.right - r.left,
-            height: r.bottom - r.top,
-        }
-    }
-}
-
-impl Into<RECT> for Rect {
-    fn into(self) -> RECT {
-        RECT {
-            top: self.y,
-            left: self.x,
-            bottom: self.y + self.height,
-            right: self.x + self.width,
-        }
-    }
-}
-
-impl Rect {
-    #[inline]
-    pub fn area(&self) -> i32 {
-        self.width * self.height
-    }
-
-    pub fn intersection(&self, other: &Self) -> Self {
-        let x1 = self.x.max(other.x);
-        let y1 = self.y.max(other.y);
-        let x2 = (self.x + self.width).min(other.x + other.width);
-        let y2 = (self.y + self.height).min(other.y + other.height);
-
-        if x1 < x2 && y1 < y2 {
-            Self {
-                x: x1,
-                y: y1,
-                width: x2 - x1,
-                height: y2 - y1,
-            }
-        } else {
-            Rect::default()
-        }
-    }
-
-    pub fn center(&self) -> Point {
-        let x = self.x + self.width / 2;
-        let y = self.y + self.height / 2;
-        Point { x, y }
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Point {
-    x: i32,
-    y: i32,
-}
-
-impl Point {
-    pub fn distance(&self, other: Self) -> i32 {
-        ((self.x - other.x).pow(2) as f32 + (self.y - other.y).pow(2) as f32).sqrt() as i32
-    }
-}
 
 pub fn get_focused_window() -> Window {
     let hwnd = unsafe { GetForegroundWindow() };
@@ -276,7 +191,7 @@ pub fn get_all_monitors(ctx: &Context) -> Vec<Monitor, &Arena> {
     let mut monitors = Vec::new_in(&ctx.arena);
     let success: bool = unsafe {
         EnumDisplayMonitors(
-            HDC(0),
+            HDC(std::ptr::null_mut()),
             None,
             Some(push_monitor),
             LPARAM(&mut monitors as *mut _ as isize),
@@ -341,9 +256,9 @@ fn set_stack_layout(ctx: &Context, monitor: Monitor) {
     }
 }
 
-fn set_full_layout(monitor: Monitor) {}
+fn set_full_layout(_monitor: Monitor) {}
 
-pub fn keep_layout(ctx: &Context, monitor: Monitor, window: Window) {}
+// pub fn keep_layout(ctx: &Context, monitor: Monitor, window: Window) {}
 
 pub fn move_focus(ctx: &Context, direction: Direction) {
     let origin_window = get_focused_window();

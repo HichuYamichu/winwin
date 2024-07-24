@@ -1,8 +1,16 @@
 use winwin::*;
-use winwin_common::*;
 
 fn main() {
     println!("Hello, world!");
+
+    let subscriber = tracing_subscriber::fmt()
+        .compact()
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_target(false)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let mod_key = Key::AltLeft;
     let mut queue = EventQueue::new();
@@ -51,13 +59,12 @@ fn main() {
                     apply_layout(&ctx, get_focused_monitor(), Layout::Grid);
                 }
             }
-            Event::WindowOpen(window) => {
-                // dbg!(window);
-                // let monitor = get_monitor_with_window(window);
-                // keep_layout(&ctx, monitor, window);
+            Event::WindowOpen(window, /*monitor*/ rect) => {
+                dbg!(window, rect);
+                // keep_layout(&ctx, monitor, window, rect);
             }
             Event::WindowClose(window) => {
-                // dbg!(window);
+                dbg!(window);
             }
             Event::Shutdown => {
                 break;
