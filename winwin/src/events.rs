@@ -20,6 +20,7 @@ use crate::{Arena, Context, Key, KeyState, Window};
 pub use winwin_common::KBDelta;
 
 const THREAD_POOL_SIZE: usize = 2;
+const PIPE_INSTANCES_PER_WORKER: usize = 10;
 const BUFFER_SIZE: usize = 1024;
 const PIPE_NAME: PCSTR = s!("\\\\.\\pipe\\winwin_pipe");
 
@@ -230,9 +231,8 @@ unsafe fn handle_iocp(
                 match enqueue_pipe_read(io_data) {
                     Ok(_) => io_data.state = State::WaitingForDisconnect,
                     Err(_) => {
-                        // NOTE: We ignore this error since this is a dummy read.
                         // If client released their handle already we get here.
-                        // If not then `GetQueuedCompletionStatus` will catch that.
+                        // If not then `GetQueuedCompletionStatus` will catch this.
                         io_objects_release_channel
                             .send(io_data.as_usize())
                             .expect("pool never quits before workers");
@@ -347,7 +347,7 @@ impl IocpWorkerPool {
         iocp: SyncHandle,
         event_tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
     ) -> Self {
-        let pipe_instance_count = 10 * THREAD_POOL_SIZE;
+        let pipe_instance_count = PIPE_INSTANCES_PER_WORKER * THREAD_POOL_SIZE;
         let (io_objects_tx, io_objects_rx) = sync_channel(pipe_instance_count);
 
         let (allocation, slice) = unsafe {
@@ -409,6 +409,8 @@ impl IocpWorkerPool {
                 s.spawn(move || unsafe { handle_iocp(iocp, release_channel, event_tx) });
             }
 
+            // We drop this sender so that only senders left are ones owned by woker threads, this
+            // enables the following loop to exit once all workers quit.
             drop(io_objects_release_channel);
 
             while let Some(io_data) = self.io_objects_pool.iter().next() {
