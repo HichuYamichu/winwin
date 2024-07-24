@@ -1,8 +1,11 @@
-use std::{ops::Deref};
+use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 
-use windows::Win32::{Foundation::{HANDLE, RECT}, UI::WindowsAndMessaging::CREATESTRUCTA};
+use windows::Win32::{
+    Foundation::{HANDLE, RECT},
+    UI::WindowsAndMessaging::CREATESTRUCTA,
+};
 
 mod keys;
 pub use keys::*;
@@ -44,23 +47,12 @@ pub struct KBDelta {
 
 pub struct WindowCrateData {}
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
     pub width: i32,
     pub height: i32,
-}
-
-impl Default for Rect {
-    fn default() -> Self {
-        Self {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-        }
-    }
 }
 
 impl From<RECT> for Rect {
@@ -85,13 +77,13 @@ impl From<CREATESTRUCTA> for Rect {
     }
 }
 
-impl Into<RECT> for Rect {
-    fn into(self) -> RECT {
+impl From<Rect> for RECT {
+    fn from(val: Rect) -> Self {
         RECT {
-            top: self.y,
-            left: self.x,
-            bottom: self.y + self.height,
-            right: self.x + self.width,
+            top: val.y,
+            left: val.x,
+            bottom: val.y + val.height,
+            right: val.x + val.width,
         }
     }
 }

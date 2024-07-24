@@ -20,6 +20,11 @@ fn main() {
         let event = queue.next_event(&ctx);
         match event {
             Event::KeyPress(input) => {
+                if input.all_pressed(&[mod_key, Key::X]) {
+                    queue.shutdown();
+                    break;
+                }
+
                 // Change focused window.
                 if input.all_pressed(&[mod_key, Key::L]) {
                     move_focus(&ctx, Direction::Right);

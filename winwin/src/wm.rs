@@ -307,5 +307,5 @@ pub fn get_adjacent(ctx: &Context, window: Window, direction: Direction) -> Opti
         da.cmp(&db)
     });
 
-    candidate_windows.get(0).map(|(w, _)| **w)
+    candidate_windows.first().map(|(w, _)| **w)
 }

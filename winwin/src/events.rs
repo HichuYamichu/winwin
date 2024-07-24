@@ -1,10 +1,12 @@
 use allocator_api2::vec::*;
 use core::slice;
 use std::alloc;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, sync_channel};
 use std::sync::mpsc::{Receiver, SyncSender};
+use std::thread;
+use std::thread::JoinHandle;
 use std::thread::Thread;
-use std::{marker::PhantomData, thread};
 use windows::Win32::Foundation::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
@@ -42,6 +44,10 @@ pub enum Event<'a> {
 pub struct EventQueue {
     ev_rx: Receiver<(ClientEvent, SyncSender<ServerCommand>)>,
     key_map: KeyMap,
+
+    iocp_handle: HANDLE,
+    join_handles: [JoinHandle<()>; 2],
+    hook_thread_id: u32,
 }
 
 impl EventQueue {
@@ -49,13 +55,24 @@ impl EventQueue {
         // NOTE: Buffer should be big enough to handle spontaneous bursts of events.
         let (tx, rx) = mpsc::sync_channel(128);
 
-        thread::spawn(|| unsafe { install_pipe_server(tx) });
-        thread::spawn(|| unsafe { install_hooks() });
-        // seve this handles and join them on shutdown.
+        let iocp = create_io_completion_port();
+        let (hook_thread_id_tx, hook_thread_id_rx) = sync_channel(0);
+
+        let join_handles = [
+            thread::spawn(move || unsafe { install_pipe_server(tx, iocp) }),
+            thread::spawn(|| unsafe { install_hooks(hook_thread_id_tx) }),
+        ];
+
+        // This nonsense in necessary because Rust's ThreadId has nothing to do with actual thread id.
+        let hook_thread_id = hook_thread_id_rx.recv().unwrap();
 
         Self {
             ev_rx: rx,
             key_map: KeyMap::default(),
+
+            iocp_handle: *iocp,
+            join_handles,
+            hook_thread_id,
         }
     }
 
@@ -93,14 +110,52 @@ impl EventQueue {
             }
         }
     }
+
+    // `shutdown` must be called explicitly before application can exit.
+    pub fn shutdown(self) {
+        unsafe {
+            // This will unblock `install_hooks` thread which cleans up after itself.
+            let _ = PostThreadMessageA(self.hook_thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+            // This will wake up all workder threads and cause them to shutdown.
+            let _ = CloseHandle(self.iocp_handle);
+        }
+
+        // self.shutdown_tx
+        //     .send(())
+        //     .expect("listening thread should be around at this point");
+
+        for h in self.join_handles {
+            let _ = h.join();
+        }
+        tracing::trace!("shutdown done");
+    }
 }
 
-unsafe fn install_pipe_server(tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>) {
-    let iocp = unsafe {
-        CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, THREAD_POOL_SIZE as _).unwrap()
-    };
-    let iocp = SyncHandle(iocp);
+unsafe fn install_hooks(thread_id_tx: SyncSender<u32>) {
+    thread_id_tx.send(GetCurrentThreadId()).unwrap();
 
+    let dll_name = s!("hooks.dll");
+    let h_instance =
+        GetModuleHandleA(dll_name).expect("required dll has to be loaded at this point");
+
+    let kb_hook =
+        SetWindowsHookExA(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), h_instance, 0).unwrap();
+    let cbt_hook = SetWindowsHookExA(WH_CBT, Some(cbt_proc), h_instance, 0).unwrap();
+
+    // GetMessageA will return once PostThreadMessageA in `EventQueue::shutdown` posts a message.
+    let mut msg = MSG::default();
+    let _ = GetMessageA(&mut msg as *mut _, None, 0, 0);
+
+    tracing::trace!("hooks unloaded");
+
+    let _ = UnhookWindowsHookEx(kb_hook);
+    let _ = UnhookWindowsHookEx(cbt_hook);
+}
+
+unsafe fn install_pipe_server(
+    tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
+    iocp: SyncHandle,
+) {
     let pool = IoDataPool::new(10, *iocp);
 
     thread::scope(|s| {
@@ -110,11 +165,6 @@ unsafe fn install_pipe_server(tx: SyncSender<(ClientEvent, SyncSender<ServerComm
         }
         accept_pipe_connections(&pool);
     });
-
-    // TODO: add atomic bool `is_shutting_down`
-    // We only get here if there was as shutdown signal.
-    // pool.free_all(); // Close pipes and io objects.
-    // close iocp
 }
 
 unsafe fn handle_pipe_client(
@@ -135,12 +185,21 @@ unsafe fn handle_pipe_client(
             INFINITE,
         );
 
-        if result.is_err() {
-            tracing::trace!(?result);
-            if !overlapped.is_null() {
+        if let Err(e) = result {
+            if e == ERROR_ABANDONED_WAIT_0.into() || e == ERROR_INVALID_HANDLE.into() {
+                // Thread pool is shutting down we need to quit.
+                tracing::trace!("thread pool worker quit");
+                pool.shutdown();
+                break;
+            } else if e == ERROR_BROKEN_PIPE.into() && !overlapped.is_null() {
+                // Client disconnected, release this `io_data` and continue.
                 let io_data = &mut *(overlapped as *mut IoData);
                 pool.release(io_data);
+            } else {
+                // Unexpected error.
+                tracing::warn!(?e);
             }
+
             continue;
         }
 
@@ -160,7 +219,6 @@ unsafe fn handle_pipe_client(
             State::ReadEnqueued => {
                 let client_message: ClientEvent =
                     bincode::deserialize(&io_data.buffer[..bytes_transferred as usize]).unwrap();
-                // tracing::info!(?client_message);
                 let (command_tx, command_rx) = mpsc::sync_channel(0);
                 tx.send((client_message, command_tx))
                     .expect("other end should not quit before this thread");
@@ -232,16 +290,30 @@ unsafe fn enqueue_pipe_write(io_data: &mut IoData) -> windows::core::Result<()> 
 fn accept_pipe_connections(pool: &IoDataPool) {
     loop {
         unsafe {
-            let io_data = pool.get();
-            let pipe = (*io_data).pipe;
-            let overlapped = &mut (*io_data).overlapped as *mut _;
-            if let Err(e) = ConnectNamedPipe(pipe, Some(overlapped)) {
-                if e != ERROR_IO_PENDING.into() {
-                    tracing::warn!(?e);
+            match pool.get() {
+                Ok(io_data) => {
+                    let pipe = (*io_data).pipe;
+                    let overlapped = &mut (*io_data).overlapped as *mut _;
+                    if let Err(e) = ConnectNamedPipe(pipe, Some(overlapped)) {
+                        if e != ERROR_IO_PENDING.into() {
+                            tracing::warn!(?e);
+                        }
+                    }
+                }
+                Err(_) => {
+                    // We are shutting down.
+                    break;
                 }
             }
         };
     }
+}
+
+fn create_io_completion_port() -> SyncHandle {
+    let iocp = unsafe {
+        CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, THREAD_POOL_SIZE as _).unwrap()
+    };
+    SyncHandle(iocp)
 }
 
 #[repr(C)]
@@ -256,7 +328,7 @@ struct IoData {
 impl IoData {
     fn reset(io_data: *mut Self) {
         unsafe {
-            let _ = DisconnectNamedPipe((*io_data).pipe).unwrap();
+            let _ = DisconnectNamedPipe((*io_data).pipe);
             (*io_data).overlapped = OVERLAPPED::default();
             (*io_data).buffer.as_mut_slice().fill(0);
             (*io_data).state = State::WaitingForConnection;
@@ -286,6 +358,12 @@ enum State {
 struct IoDataPool {
     queue: ArrayQueue<usize>,
     sleeper: AtomicCell<Option<Thread>>,
+
+    // Alias to allocation holding all `IoData` objects. It is accessed only in drop impl and thus
+    // is safe because drop is guaranteed to be run exclusively by one thread.
+    alloc_alias: usize,
+    size: usize,
+    shutting_down: AtomicBool,
 }
 
 impl IoDataPool {
@@ -294,9 +372,9 @@ impl IoDataPool {
 
         let layout = alloc::Layout::array::<IoData>(size).expect("arguments are correct");
         let mem = unsafe { alloc::alloc(layout) };
-        let mem = unsafe { slice::from_raw_parts_mut::<IoData>(mem as *mut _, size) };
+        let slice = unsafe { slice::from_raw_parts_mut::<IoData>(mem as *mut _, size) };
 
-        for slot in 0..size {
+        for slot in slice.iter_mut() {
             let pipe = unsafe {
                 CreateNamedPipeA(
                     PIPE_NAME,
@@ -311,8 +389,8 @@ impl IoDataPool {
             }
             .unwrap();
 
-            mem[slot].pipe = pipe;
-            let io_data_ptr = &mut mem[slot] as *mut _;
+            slot.pipe = pipe;
+            let io_data_ptr = slot as *mut _;
 
             unsafe {
                 CreateIoCompletionPort(pipe, iocp, io_data_ptr as usize, 0).unwrap();
@@ -326,14 +404,23 @@ impl IoDataPool {
         Self {
             queue,
             sleeper: AtomicCell::new(None),
+
+            alloc_alias: mem as _,
+            size,
+            shutting_down: AtomicBool::new(false),
         }
     }
 
     // SAFETY: `get` can only by called by one thread.
-    unsafe fn get(&self) -> *mut IoData {
+    unsafe fn get(&self) -> Result<*mut IoData, ()> {
         loop {
+            // We were woken up to singnal a shutdown.
+            if self.shutting_down.load(Ordering::Relaxed) {
+                return Err(());
+            }
+
             match self.queue.pop() {
-                Some(data) => return data as *mut _,
+                Some(data) => return Ok(data as *mut _),
                 None => {
                     let thread_id = thread::current();
                     self.sleeper.store(Some(thread_id));
@@ -352,31 +439,34 @@ impl IoDataPool {
             sleeper.unpark();
         }
     }
+
+    fn shutdown(&self) {
+        if !self.shutting_down.swap(true, Ordering::Relaxed) {
+            // Unpark listener thread. I will signal that pool is shutting down to the caller.
+            if let Some(sleeper) = self.sleeper.swap(None) {
+                sleeper.unpark();
+            }
+        }
+    }
 }
 
-unsafe fn install_hooks() {
-    let dll_name = s!("hooks.dll");
-    let h_instance =
-        GetModuleHandleA(dll_name).expect("required dll has to be loaded at this point");
+impl Drop for IoDataPool {
+    fn drop(&mut self) {
+        tracing::trace!("pool dropped");
+        let slice =
+            unsafe { slice::from_raw_parts_mut::<IoData>(self.alloc_alias as *mut _, self.size) };
+        for io_data in slice {
+            let _ = unsafe { CloseHandle(io_data.pipe) };
+        }
 
-    let _ = SetWindowsHookExA(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), h_instance, 0);
-    let _ = SetWindowsHookExA(WH_CBT, Some(cbt_proc), h_instance, 0).unwrap();
-
-    let _ = GetMessageA(std::ptr::null_mut(), None, 0, 0);
+        let layout = alloc::Layout::array::<IoData>(self.size).expect("arguments are correct");
+        unsafe { alloc::dealloc(self.alloc_alias as *mut _, layout) };
+    }
 }
 
-unsafe fn uninstall_hooks() {
-    // UnhookWindowsHookEx()
-}
-
+#[derive(Default)]
 pub struct KeyMap {
     keys: [u32; 8],
-}
-
-impl Default for KeyMap {
-    fn default() -> Self {
-        KeyMap { keys: [0; 8] }
-    }
 }
 
 impl KeyMap {

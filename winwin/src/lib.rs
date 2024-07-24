@@ -51,19 +51,9 @@ impl Arena {
         }
     }
 
-    pub fn new_in(base: &mut [u8]) -> Self {
-        todo!()
-    }
-
     pub fn reset(&self) {
         self.end.set(0);
         self.used.set(0);
-    }
-
-    pub fn buff<T>(&self, size: usize) -> &mut [T] {
-        let layout = alloc::Layout::array::<T>(size).unwrap();
-        let mem = self.allocate(layout).unwrap();
-        unsafe { std::slice::from_raw_parts_mut(mem.as_ptr() as *mut _, size) }
     }
 }
 

@@ -1,16 +1,15 @@
-use std::sync::Once;
 use windows::core::{s, PCSTR};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Pipes::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::fmt::Subscriber;
 
-use winwin_common::{ClientEvent, Rect, ServerCommand};
+use winwin_common::{ClientEvent, KBDelta, KeyState, Rect, ServerCommand};
 
 const PIPE_NAME: PCSTR = s!("\\\\.\\pipe\\winwin_pipe");
 const BUFFER_SIZE: usize = 512;
@@ -20,6 +19,7 @@ const BUFFER_SIZE: usize = 512;
 #[no_mangle]
 #[allow(non_snake_case, unused_variables)]
 extern "system" fn DllMain(dll_module: HINSTANCE, call_reason: u32, _: *mut ()) -> bool {
+
     // TODO: Threads are racing to this log file.
     match call_reason {
         DLL_PROCESS_ATTACH => {
@@ -33,6 +33,7 @@ extern "system" fn DllMain(dll_module: HINSTANCE, call_reason: u32, _: *mut ()) 
             // There's nothing we can do if this fails.
             let _ = tracing::subscriber::set_global_default(subscriber);
         }
+        _ => {}
     }
 
     true
@@ -95,11 +96,23 @@ unsafe extern "system" fn low_level_keyboard_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if code == HC_ACTION as _ {
-        // let kb_info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        // let kb_delta = KBDelta {
-        //     vk_code: kb_info.vkCode as _,
-        //     key_state: KeyState::from(wparam),
-        // };
+        let kb_info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let kb_delta = KBDelta {
+            vk_code: kb_info.vkCode as _,
+            key_state: KeyState::from(wparam),
+        };
+
+        let event = ClientEvent::Keyboard(kb_delta);
+        match send_event(event) {
+            Ok(command) => {
+                if matches!(command, ServerCommand::InterceptKeypress) {
+                    return LRESULT(-1);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(?e);
+            }
+        }
     }
 
     return CallNextHookEx(None, code, wparam, lparam);
