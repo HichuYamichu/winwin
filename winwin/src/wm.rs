@@ -1,9 +1,8 @@
 use allocator_api2::vec::*;
-use windows::{
-    Win32::Foundation::*, Win32::Graphics::Gdi::*, Win32::System::Threading::*,
-    Win32::UI::WindowsAndMessaging::*,
-};
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::{Win32::Foundation::*, Win32::Graphics::Gdi::*, Win32::System::Threading::*};
 use winwin_common::Rect;
+use std::hash::{Hash, Hasher};
 
 use crate::{Arena, Context};
 
@@ -14,17 +13,12 @@ pub enum Direction {
     Down,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct Window {
     pub handle: HWND,
 }
 
 impl Window {
-    pub const NULL_HWND: HWND = HWND(std::ptr::null_mut());
-    pub const NULL: Window = Window {
-        handle: Self::NULL_HWND,
-    };
-
     pub fn rect(&self) -> Rect {
         let mut rect = RECT::default();
         let res = unsafe { GetWindowRect(self.handle, &mut rect as *mut _) };
@@ -34,6 +28,19 @@ impl Window {
         }
     }
 
+    pub fn client_rect(&self) -> Rect {
+        let mut rect = RECT::default();
+        let res = unsafe { GetClientRect(self.handle, &mut rect as *mut _) };
+        match res {
+            Ok(_) => rect.into(),
+            Err(_) => Rect::default(),
+        }
+    }
+
+    pub fn toolbar_height(&self) -> i32 {
+        32
+    }
+
     pub fn set_rect(&self, rect: Rect) {
         if rect == Rect::default() {
             return;
@@ -41,7 +48,7 @@ impl Window {
         let res = unsafe {
             SetWindowPos(
                 self.handle,
-                Self::NULL_HWND,
+                HWND::default(),
                 rect.x,
                 rect.y,
                 rect.width,
@@ -54,7 +61,7 @@ impl Window {
 
     pub fn is_on_monitor(&self, monitor: Monitor) -> bool {
         let wr = self.rect();
-        let intersection = wr.intersection(&monitor.bounding_rect());
+        let intersection = wr.intersection(&monitor.rect());
 
         let window_area = wr.area();
         let intersect_area = intersection.area();
@@ -82,6 +89,11 @@ impl Window {
         todo!()
     }
 
+    pub fn style(&self) -> WINDOW_STYLE {
+        let style = unsafe { GetWindowLongW(self.handle, GWL_STYLE) };
+        WINDOW_STYLE(style as _)
+    }
+
     pub fn focus(&self) {
         unsafe {
             let current_thread_id = GetCurrentThreadId();
@@ -94,8 +106,33 @@ impl Window {
         };
     }
 
-    pub fn is_null(&self) -> bool {
-        *self == Self::NULL
+    pub fn maximize(&self) {
+        let err = unsafe {
+            PostMessageA(
+                self.handle,
+                WM_SYSCOMMAND,
+                WPARAM(SC_MAXIMIZE as _),
+                LPARAM(0),
+            );
+        };
+        tracing::warn!(?err);
+    }
+
+    pub fn minimize(&self) {
+        unsafe {
+            unsafe {
+                PostMessageA(
+                    self.handle,
+                    WM_SYSCOMMAND,
+                    WPARAM(SC_MINIMIZE as _),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+
+    pub fn is_invalid(&self) -> bool {
+        self.handle.is_invalid()
     }
 }
 
@@ -104,8 +141,8 @@ pub struct WindowInfo {}
 
 pub fn get_focused_window() -> Window {
     let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd == Window::NULL_HWND {
-        return Window::NULL;
+    if hwnd.is_invalid() {
+        return Window::default();
     }
     Window { handle: hwnd }
 }
@@ -146,13 +183,13 @@ pub fn is_minimised(window: Window) -> bool {
     unsafe { IsIconic(window.handle).into() }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct Monitor {
     handle: HMONITOR,
 }
 
 impl Monitor {
-    pub fn bounding_rect(&self) -> Rect {
+    pub fn rect(&self) -> Rect {
         let mut info = MONITORINFO {
             cbSize: core::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
@@ -160,7 +197,13 @@ impl Monitor {
 
         let success = unsafe { GetMonitorInfoW(self.handle, &mut info).as_bool() };
         assert!(success);
-        info.rcMonitor.into()
+        info.rcWork.into()
+    }
+}
+
+impl Hash for Monitor {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.handle.0.hash(state);
     }
 }
 
@@ -173,6 +216,12 @@ pub fn get_focused_monitor() -> Monitor {
 pub fn get_monitor_with_window(window: Window) -> Monitor {
     let handle = unsafe { MonitorFromWindow(window.handle, MONITOR_DEFAULTTOPRIMARY) };
     Monitor { handle }
+}
+
+pub fn get_windows_on_monitor(ctx: &Context, monitor: Monitor) -> Vec<Window, &Arena> {
+    let mut windows = get_all_windows(ctx);
+    windows.retain(|w| w.is_on_monitor(monitor));
+    windows
 }
 
 pub fn get_all_monitors(ctx: &Context) -> Vec<Monitor, &Arena> {
@@ -203,7 +252,10 @@ pub fn get_all_monitors(ctx: &Context) -> Vec<Monitor, &Arena> {
     monitors
 }
 
+#[derive(Default, Clone, Copy)]
 pub enum Layout {
+    #[default]
+    None,
     Stack,
     Grid,
     Full,
@@ -211,54 +263,132 @@ pub enum Layout {
 
 pub fn apply_layout(ctx: &Context, monitor: Monitor, layout: Layout) {
     match layout {
+        Layout::None => {},
         Layout::Stack => set_stack_layout(ctx, monitor),
-        Layout::Grid => set_stack_layout(ctx, monitor),
-        Layout::Full => set_stack_layout(ctx, monitor),
+        Layout::Grid => set_grid_layout(ctx, monitor),
+        Layout::Full => set_full_layout(ctx, monitor),
     }
 }
 
 fn set_stack_layout(ctx: &Context, monitor: Monitor) {
-    let mut windows = get_all_windows(ctx);
-    windows.retain(|w| w.is_on_monitor(monitor));
+    let windows = get_windows_on_monitor(ctx, monitor);
 
     match windows.len() {
         0 => return,
-        1 => set_full_layout(monitor),
+        1 => set_full_layout(ctx, monitor),
         _ => {
-            let monitor_rect = monitor.bounding_rect();
-            let partitions_needed = windows.len() as i32 - 1;
-            let partition_width = monitor_rect.width / 2;
-            let partition_height = monitor_rect.height / partitions_needed;
+            let mut window_rects = Vec::with_capacity_in(windows.len(), &ctx.arena);
+            for window in windows.iter() {
+                window_rects.push(window.rect());
+            }
 
-            let main_window_rect = Rect {
-                x: monitor_rect.x,
-                y: monitor_rect.y,
-                width: partition_width,
-                height: monitor_rect.height,
-            };
+            let monitor_rect = monitor.rect();
 
-            let mut window_iter = windows.iter();
-            let main_window = window_iter.next().expect("there are multiple windows");
-            main_window.set_rect(main_window_rect);
+            translate_rects_for_stack(monitor_rect, &windows, &mut window_rects);
 
-            let mut sub_window_rect = Rect {
-                x: main_window_rect.x + partition_width,
-                y: 0,
-                width: partition_width,
-                height: partition_height,
-            };
-
-            for window in window_iter {
-                window.set_rect(sub_window_rect);
-                sub_window_rect.y += partition_height;
+            for (window, rect) in windows.into_iter().zip(window_rects.into_iter()) {
+                window.set_rect(rect);
             }
         }
     }
 }
 
-fn set_full_layout(_monitor: Monitor) {}
+fn translate_rects_for_stack(bounding_rect: Rect, windows: &[Window], rects: &mut [Rect]) {
+    let partitions_needed = windows.len() as i32 - 1;
+    let partition_width = bounding_rect.width / 2;
+    let partition_height = bounding_rect.height / partitions_needed;
 
-// pub fn keep_layout(ctx: &Context, monitor: Monitor, window: Window) {}
+    let main_window = windows[0];
+    let main_style = main_window.style();
+    let main_toolbar_height = main_window.toolbar_height();
+    rects[0] = Rect {
+        x: bounding_rect.x,
+        y: bounding_rect.y + main_toolbar_height,
+        width: partition_width,
+        height: bounding_rect.height - main_toolbar_height,
+    }
+    .adjusted(main_style);
+
+    for (i, rect) in rects[1..].iter_mut().enumerate() {
+        let r = Rect {
+            x: bounding_rect.x + partition_width,
+            y: bounding_rect.y + i as i32 * partition_height + windows[i].toolbar_height(),
+            width: partition_width,
+            height: partition_height - windows[i].toolbar_height(),
+        };
+
+        let style = windows[i].style();
+        *rect = r.adjusted(style);
+    }
+}
+
+fn set_grid_layout(ctx: &Context, monitor: Monitor) {
+    let windows = get_windows_on_monitor(ctx, monitor);
+
+    match windows.len() {
+        0 => return,
+        1 => set_full_layout(ctx, monitor),
+        _ => {
+            let mut window_rects = Vec::with_capacity_in(windows.len(), &ctx.arena);
+            for window in windows.iter() {
+                window_rects.push(window.rect());
+            }
+
+            let monitor_rect = monitor.rect();
+
+            translate_rects_for_grid(monitor_rect, &windows, &mut window_rects);
+
+            for (window, rect) in windows.into_iter().zip(window_rects.into_iter()) {
+                window.set_rect(rect);
+            }
+        }
+    }
+}
+
+fn translate_rects_for_grid(bounding_rect: Rect, windows: &[Window], rects: &mut [Rect]) {
+    let window_count = windows.len() as i32;
+    let rows = (window_count as f32).sqrt().ceil() as i32;
+    let cols = (window_count + rows - 1) / rows;
+
+    let cell_width = bounding_rect.width / cols;
+    let cell_height = bounding_rect.height / rows;
+
+    for (i, (rect, window)) in rects.iter_mut().zip(windows.iter()).enumerate() {
+        let row = i as i32 / cols;
+        let col = i as i32 % cols;
+
+        let is_last_odd = i == window_count as usize - 1 && window_count % 2 == 1;
+
+        let title_bar_height = window.toolbar_height();
+        let style = window.style();
+
+        let r = if is_last_odd {
+            Rect {
+                x: bounding_rect.x,
+                y: bounding_rect.y + row * cell_height + title_bar_height,
+                width: bounding_rect.width,
+                height: cell_height - title_bar_height,
+            }
+        } else {
+            Rect {
+                x: bounding_rect.x + col * cell_width,
+                y: bounding_rect.y + row * cell_height + title_bar_height,
+                width: cell_width,
+                height: cell_height - title_bar_height,
+            }
+        };
+
+        *rect = r.adjusted(style);
+    }
+}
+
+fn set_full_layout(ctx: &Context, monitor: Monitor) {
+    let monitor_rect = monitor.rect();
+    let windows = get_windows_on_monitor(ctx, monitor);
+    for window in windows {
+        window.set_rect(monitor_rect);
+    }
+}
 
 pub fn move_focus(ctx: &Context, direction: Direction) {
     let origin_window = get_focused_window();
@@ -292,8 +422,8 @@ pub fn get_adjacent(ctx: &Context, window: Window, direction: Direction) -> Opti
     let windows_in_direction = window_centers
         .filter(|(w, _)| !is_minimised(**w))
         .filter(|(_, p)| match direction {
-            Direction::Up => p.y > origin_center.y,
-            Direction::Down => p.y <= origin_center.y,
+            Direction::Up => p.y <= origin_center.y,
+            Direction::Down => p.y > origin_center.y,
             Direction::Left => p.x < origin_center.x,
             Direction::Right => p.x >= origin_center.x,
         })

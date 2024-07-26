@@ -2,10 +2,7 @@ use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 
-use windows::Win32::{
-    Foundation::{HANDLE, RECT},
-    UI::WindowsAndMessaging::CREATESTRUCTA,
-};
+use windows::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
 
 mod keys;
 pub use keys::*;
@@ -34,7 +31,7 @@ pub enum ServerCommand {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientEvent {
-    WindowOpen(usize, Rect),
+    WindowOpen(usize),
     WindowClose(usize),
     Keyboard(KBDelta),
 }
@@ -44,8 +41,6 @@ pub struct KBDelta {
     pub vk_code: u8,
     pub key_state: KeyState,
 }
-
-pub struct WindowCrateData {}
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
@@ -116,6 +111,12 @@ impl Rect {
         let x = self.x + self.width / 2;
         let y = self.y + self.height / 2;
         Point { x, y }
+    }
+
+    pub fn adjusted(&self, style: WINDOW_STYLE) -> Self {
+        let mut r = RECT::from(*self);
+        unsafe { AdjustWindowRect(&mut r as *mut _, style, false).unwrap() };
+        r.into()
     }
 }
 

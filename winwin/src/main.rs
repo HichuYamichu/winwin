@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use tracing::Level;
 use winwin::*;
 
@@ -17,6 +19,7 @@ fn main() {
     let mod_key = Key::AltLeft;
     let mut queue = EventQueue::new();
     let ctx = Context::new();
+    let mut monitor_configs = HashMap::new();
 
     loop {
         let event = queue.next_event(&ctx);
@@ -53,28 +56,48 @@ fn main() {
                     swap_adjacent(&ctx, get_focused_window(), Direction::Left);
                 }
 
+                if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::J]) {
+                    swap_adjacent(&ctx, get_focused_window(), Direction::Down);
+                }
+
+                if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::K]) {
+                    swap_adjacent(&ctx, get_focused_window(), Direction::Up);
+                }
+
                 // Apply selected layout.
                 if input.all_pressed(&[mod_key, Key::Q]) {
-                    apply_layout(&ctx, get_focused_monitor(), Layout::Stack);
+                    let monitor = get_focused_monitor();
+                    apply_layout(&ctx, monitor, Layout::Stack);
+                    monitor_configs.insert(monitor, Layout::Stack);
                 }
 
                 if input.all_pressed(&[mod_key, Key::W]) {
-                    apply_layout(&ctx, get_focused_monitor(), Layout::Full);
+                    let monitor = get_focused_monitor();
+                    apply_layout(&ctx, monitor, Layout::Full);
+                    monitor_configs.insert(monitor, Layout::Full);
                 }
 
                 if input.all_pressed(&[mod_key, Key::E]) {
-                    apply_layout(&ctx, get_focused_monitor(), Layout::Grid);
+                    let monitor = get_focused_monitor();
+                    apply_layout(&ctx, monitor, Layout::Grid);
+                    monitor_configs.insert(monitor, Layout::Grid);
+                }
+
+                if input.all_pressed(&[mod_key, Key::R]) {
+                    let monitor = get_focused_monitor();
+                    apply_layout(&ctx, monitor, Layout::None);
+                    monitor_configs.insert(monitor, Layout::None);
                 }
             }
-            Event::WindowOpen(window, /*monitor*/ rect) => {
-                // dbg!(window, rect);
-                // keep_layout(&ctx, monitor, window, rect);
+            Event::WindowOpen(window) => {
+                let monitor = get_monitor_with_window(window);
+                let layout = monitor_configs.get(&monitor).unwrap_or(&Layout::None);
+                apply_layout(&ctx, monitor, *layout);
             }
             Event::WindowClose(window) => {
-                // dbg!(window);
-            }
-            Event::Shutdown => {
-                break;
+                let monitor = get_monitor_with_window(window);
+                let layout = monitor_configs.get(&monitor).unwrap_or(&Layout::None);
+                apply_layout(&ctx, monitor, *layout);
             }
         }
     }

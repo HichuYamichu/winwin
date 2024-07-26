@@ -1,6 +1,7 @@
 use allocator_api2::alloc::AllocError;
 use allocator_api2::alloc::Allocator;
 use std::cell::Cell;
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::{alloc, ptr::NonNull};
 
@@ -15,15 +16,12 @@ pub use wm::*;
 pub struct Context {
     // Arena allocator for temporary (frame) allocations.
     arena: Arena,
-    // Presistent data uses global allocator.
-    monitor_configs: HashMap<Monitor, Layout>,
 }
 
 impl Context {
     pub fn new() -> Self {
         Self {
             arena: Arena::new_unbounded(),
-            monitor_configs: HashMap::new(),
         }
     }
 }

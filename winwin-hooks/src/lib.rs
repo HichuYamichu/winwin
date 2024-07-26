@@ -2,9 +2,9 @@ use windows::core::{s, PCSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Pipes::*;
+use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::fmt::Subscriber;
@@ -19,7 +19,6 @@ const BUFFER_SIZE: usize = 512;
 #[no_mangle]
 #[allow(non_snake_case, unused_variables)]
 extern "system" fn DllMain(dll_module: HINSTANCE, call_reason: u32, _: *mut ()) -> bool {
-
     // TODO: Threads are racing to this log file.
     match call_reason {
         DLL_PROCESS_ATTACH => {
@@ -59,21 +58,32 @@ impl From<bincode::Error> for HookError {
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn cbt_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HCBT_CREATEWND as _ {
+pub unsafe extern "system" fn shell_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HSHELL_WINDOWCREATED as _ {
         let hwnd = HWND(wparam.0 as _);
-        let create_wnd = &*(lparam.0 as *const CBT_CREATEWNDA);
-        let creation_params = &*create_wnd.lpcs;
-        let rect = Rect::from(*creation_params);
 
-        if is_real_window(hwnd, creation_params) {
-            let event = ClientEvent::WindowOpen(hwnd.0 as _, rect);
+        if is_real_window(hwnd) {
+            let event = ClientEvent::WindowOpen(hwnd.0 as _);
             if let Err(e) = send_event(event) {
                 tracing::warn!(?e);
             }
         }
     }
 
+    if code == HSHELL_WINDOWDESTROYED as _ {
+        let hwnd = HWND(wparam.0 as _);
+
+        let event = ClientEvent::WindowClose(hwnd.0 as _);
+        if let Err(e) = send_event(event) {
+            tracing::warn!(?e);
+        }
+    }
+
+    return CallNextHookEx(None, code, wparam, lparam);
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn cbt_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HCBT_DESTROYWND as _ {
         // let hwnd = HWND(wparam.0 as _);
 
@@ -83,36 +93,6 @@ pub unsafe extern "system" fn cbt_proc(code: i32, wparam: WPARAM, lparam: LPARAM
         //         tracing::warn!(?e);
         //     }
         // }
-    }
-
-    return CallNextHookEx(None, code, wparam, lparam);
-}
-
-// This hook is called in context of main `winwin` process.
-#[no_mangle]
-unsafe extern "system" fn low_level_keyboard_proc(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    if code == HC_ACTION as _ {
-        let kb_info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        let kb_delta = KBDelta {
-            vk_code: kb_info.vkCode as _,
-            key_state: KeyState::from(wparam),
-        };
-
-        let event = ClientEvent::Keyboard(kb_delta);
-        match send_event(event) {
-            Ok(command) => {
-                if matches!(command, ServerCommand::InterceptKeypress) {
-                    return LRESULT(-1);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(?e);
-            }
-        }
     }
 
     return CallNextHookEx(None, code, wparam, lparam);
@@ -133,14 +113,13 @@ unsafe fn send_event(event: ClientEvent) -> Result<ServerCommand, HookError> {
     };
 
     let mut buffer = [0u8; BUFFER_SIZE];
-    // bincode::serialize_into(buffer.as_mut_slice(), &event)?;
-    let write_buffer = bincode::serialize(&event)?;
+    bincode::serialize_into(buffer.as_mut_slice(), &event)?;
     let mut bytes_written = 0;
 
     unsafe {
         WriteFile(
             pipe,
-            Some(write_buffer.as_slice()),
+            Some(buffer.as_slice()),
             Some(&mut bytes_written),
             None,
         )?;
@@ -158,11 +137,14 @@ unsafe fn send_event(event: ClientEvent) -> Result<ServerCommand, HookError> {
     Ok(server_command)
 }
 
-fn is_real_window(_handle: HWND, params: &CREATESTRUCTA) -> bool {
+fn is_real_window(handle: HWND) -> bool {
     // let style = params.style;
     // let ex_style = params.dwExStyle;
 
-    let this_rect = Rect::from(*params);
+    let mut r = RECT::default();
+    let _ = unsafe { GetWindowRect(handle, &mut r as *mut _) };
+
+    let this_rect = Rect::from(r);
     if this_rect.x == i32::MAX
         || this_rect.y == i32::MAX
         || this_rect.width == i32::MAX
@@ -177,37 +159,18 @@ fn is_real_window(_handle: HWND, params: &CREATESTRUCTA) -> bool {
         return false;
     }
 
-    if !params.hwndParent.is_invalid() && params.hwndParent != HWND_MESSAGE {
-        return false;
-    }
-    //
-    // if (style & WS_CHILD.0 as i32 != 0) || (style & WS_VISIBLE.0 as i32 == 0) {
-    //     return false;
-    // }
-    //
-    // if (ex_style & WS_EX_TOOLWINDOW).0 != 0 {
-    //     return false;
-    // }
-    //
-    // if !params.lpszClass.is_null() {
-    //     if params.lpszClass.0 as usize & 0xFFFF == params.lpszClass.0 as usize {
-    //         if params.lpszClass.0 as usize == 32768 {
-    //             return false;
-    //         }
-    //     } else {
-    //         let class_name = params.lpszClass;
-    //         if class_name == s!("ToolbarWindow32")
-    //             || class_name == s!("ComboBox")
-    //             || class_name == s!("msctls_progress32")
-    //         {
-    //             return false;
-    //         }
-    //     }
-    // }
-    //
-    // if params.cx <= 0 || params.cy <= 0 {
-    //     return false;
-    // }
+    let is_visible = unsafe { IsWindowVisible(handle) }.as_bool();
+    let is_top_level = unsafe { GetAncestor(handle, GA_ROOT) == handle };
 
-    true
+    let style = unsafe { GetWindowLongA(handle, GWL_STYLE) };
+    let style_ex = unsafe { GetWindowLongA(handle, GWL_EXSTYLE) };
+
+    let is_child = style & WS_CHILD.0 as i32 != 0;
+    let is_tool_window = style_ex & WS_EX_TOOLWINDOW.0 as i32 != 0;
+
+    // let mut cloaked = 0;
+    // TODO: check for cloaked window
+    tracing::info!(is_visible, is_top_level, is_child, is_tool_window);
+
+    is_visible && is_top_level && !is_child && !is_tool_window
 }

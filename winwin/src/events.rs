@@ -1,6 +1,8 @@
 use allocator_api2::vec::*;
 use core::slice;
 use std::alloc;
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 use std::sync::mpsc::{self, sync_channel};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
@@ -21,20 +23,19 @@ pub use winwin_common::KBDelta;
 
 const THREAD_POOL_SIZE: usize = 2;
 const PIPE_INSTANCES_PER_WORKER: usize = 10;
-const BUFFER_SIZE: usize = 1024;
+const BUFFER_SIZE: usize = 512;
 const PIPE_NAME: PCSTR = s!("\\\\.\\pipe\\winwin_pipe");
 
 #[link(name = "hooks.dll", kind = "dylib")]
 extern "system" {
     fn cbt_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
-    fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
+    fn shell_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
 }
 
 pub enum Event<'a> {
     KeyPress(Input<'a>),
-    WindowOpen(Window, Rect),
+    WindowOpen(Window),
     WindowClose(Window),
-    Shutdown,
 }
 
 pub struct EventQueue {
@@ -53,10 +54,11 @@ impl EventQueue {
 
         let iocp = create_io_completion_port();
         let (hook_thread_id_tx, hook_thread_id_rx) = sync_channel(0);
+        let hook_thread_event_tx = tx.clone();
 
         let join_handles = [
             thread::spawn(move || unsafe { install_pipe_server(tx, iocp) }),
-            thread::spawn(|| unsafe { install_hooks(hook_thread_id_tx) }),
+            thread::spawn(|| unsafe { install_hooks(hook_thread_event_tx, hook_thread_id_tx) }),
         ];
 
         // This nonsense in necessary because Rust's ThreadId has nothing to do with actual thread id.
@@ -82,22 +84,14 @@ impl EventQueue {
                 let input = self.key_map.input(ctx, command_tx);
                 Event::KeyPress(input)
             }
-            ClientEvent::WindowOpen(handle, rect) => {
-                command_tx
-                    .send(ServerCommand::None)
-                    .expect("Rx must be around");
-
+            ClientEvent::WindowOpen(handle) => {
                 let window = Window {
                     handle: HWND(handle as _),
                 };
 
-                Event::WindowOpen(window, rect)
+                Event::WindowOpen(window)
             }
             ClientEvent::WindowClose(handle) => {
-                command_tx
-                    .send(ServerCommand::None)
-                    .expect("Rx must be around");
-
                 let window = Window {
                     handle: HWND(handle as _),
                 };
@@ -123,8 +117,14 @@ impl EventQueue {
     }
 }
 
-unsafe fn install_hooks(thread_id_tx: SyncSender<u32>) {
-    thread_id_tx.send(GetCurrentThreadId()).unwrap();
+unsafe fn install_hooks(
+    tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
+    thread_id_tx: SyncSender<u32>,
+) {
+    thread_id_tx
+        .send(GetCurrentThreadId())
+        .expect("main thread is waiting for this id");
+    init_kb_sender(tx);
 
     let dll_name = s!("hooks.dll");
     let h_instance =
@@ -133,6 +133,7 @@ unsafe fn install_hooks(thread_id_tx: SyncSender<u32>) {
     let kb_hook =
         SetWindowsHookExA(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), h_instance, 0).unwrap();
     let cbt_hook = SetWindowsHookExA(WH_CBT, Some(cbt_proc), h_instance, 0).unwrap();
+    let shell_hook = SetWindowsHookExA(WH_SHELL, Some(shell_proc), h_instance, 0).unwrap();
 
     // GetMessageA will return once PostThreadMessageA in `EventQueue::shutdown` posts a message.
     let mut msg = MSG::default();
@@ -140,8 +141,59 @@ unsafe fn install_hooks(thread_id_tx: SyncSender<u32>) {
 
     let _ = UnhookWindowsHookEx(kb_hook);
     let _ = UnhookWindowsHookEx(cbt_hook);
+    let _ = UnhookWindowsHookEx(shell_hook);
 
     tracing::trace!("hooks unloaded");
+}
+
+//https://users.rust-lang.org/t/uninitialised-static-mut/62215/2
+type KbCh = SyncSender<(ClientEvent, SyncSender<ServerCommand>)>;
+
+struct KbChannel(UnsafeCell<MaybeUninit<KbCh>>);
+
+unsafe impl Sync for KbChannel where KbCh: Sync {}
+
+static KB_PROC_SENDER: KbChannel = KbChannel(UnsafeCell::new(MaybeUninit::uninit()));
+
+// SAFETY: Must be called by single thread.
+unsafe fn init_kb_sender(tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>) {
+    let kb_sender = unsafe { &mut *KB_PROC_SENDER.0.get() };
+    *kb_sender = MaybeUninit::new(tx);
+}
+
+// SAFETY: Must be called after channel was initialized.
+unsafe fn get_kb_sender() -> KbCh {
+    let ch_ptr = &*KB_PROC_SENDER.0.get();
+    let ch = ch_ptr.assume_init_ref().clone();
+    ch
+}
+
+unsafe extern "system" fn low_level_keyboard_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code == HC_ACTION as _ {
+        let kb_info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let kb_delta = KBDelta {
+            vk_code: kb_info.vkCode as _,
+            key_state: KeyState::from(wparam),
+        };
+
+        let event = ClientEvent::Keyboard(kb_delta);
+        let tx = get_kb_sender();
+        let (command_tx, command_rx) = sync_channel(1);
+        tx.send((event, command_tx))
+            .expect("main thread must be around at this point");
+        let command = command_rx
+            .recv()
+            .expect("hook thread must be around at this point");
+        if matches!(command, ServerCommand::InterceptKeypress) {
+            return LRESULT(-1);
+        }
+    }
+
+    return CallNextHookEx(None, code, wparam, lparam);
 }
 
 unsafe fn install_pipe_server(
@@ -254,7 +306,6 @@ impl IocpWorkerPool {
 
 impl Drop for IocpWorkerPool {
     fn drop(&mut self) {
-        tracing::trace!("pool dropped");
         let slice = unsafe {
             slice::from_raw_parts_mut::<IoData>(self.allocation as *mut _, self.pipe_instance_count)
         };
@@ -265,6 +316,7 @@ impl Drop for IocpWorkerPool {
         let layout = alloc::Layout::array::<IoData>(self.pipe_instance_count)
             .expect("arguments are correct");
         unsafe { alloc::dealloc(self.allocation as *mut _, layout) };
+        tracing::trace!("pool dropped");
     }
 }
 
@@ -364,18 +416,17 @@ unsafe fn handle_iocp(
                 }
             }
             State::ReadEnqueued => {
-                let client_message: ClientEvent =
+                let client_event: ClientEvent =
                     bincode::deserialize(&io_data.buffer[..bytes_transferred as usize]).unwrap();
-                let (command_tx, command_rx) = mpsc::sync_channel(0);
+                let (command_tx, command_rx) = mpsc::sync_channel(1);
                 event_tx
-                    .send((client_message, command_tx))
+                    .send((client_event, command_tx))
                     .expect("other end should not quit before this thread");
 
-                let command = command_rx.recv().unwrap();
-                // bincode::serialize_into(&mut io_data.buffer[..], &command).unwrap();
-                let buff = bincode::serialize(&command).unwrap();
+                let command = command_rx.recv().unwrap_or(ServerCommand::None);
+                bincode::serialize_into(&mut io_data.buffer[..], &command).unwrap();
 
-                match enqueue_pipe_write(io_data, &buff) {
+                match enqueue_pipe_write(io_data) {
                     Ok(_) => io_data.state = State::WriteEnqueued,
                     Err(e) => {
                         tracing::warn!(?e);
@@ -422,10 +473,10 @@ unsafe fn enqueue_pipe_read(io_data: &mut IoData) -> windows::core::Result<()> {
     Ok(())
 }
 
-unsafe fn enqueue_pipe_write(io_data: &mut IoData, buff: &[u8]) -> windows::core::Result<()> {
+unsafe fn enqueue_pipe_write(io_data: &mut IoData) -> windows::core::Result<()> {
     let res = WriteFile(
         io_data.pipe,
-        Some(buff),
+        Some(&mut io_data.buffer),
         None,
         Some(&mut io_data.overlapped as *mut _),
     );
