@@ -124,7 +124,7 @@ unsafe fn install_hooks(
     thread_id_tx
         .send(GetCurrentThreadId())
         .expect("main thread is waiting for this id");
-    init_kb_sender(tx);
+    KB_SENDER.init(tx);
 
     let dll_name = s!("hooks.dll");
     let h_instance =
@@ -146,26 +146,25 @@ unsafe fn install_hooks(
     tracing::trace!("hooks unloaded");
 }
 
-//https://users.rust-lang.org/t/uninitialised-static-mut/62215/2
-type KbCh = SyncSender<(ClientEvent, SyncSender<ServerCommand>)>;
+static mut KB_SENDER: KbSender = KbSender::new();
 
-struct KbChannel(UnsafeCell<MaybeUninit<KbCh>>);
-
-unsafe impl Sync for KbChannel where KbCh: Sync {}
-
-static KB_PROC_SENDER: KbChannel = KbChannel(UnsafeCell::new(MaybeUninit::uninit()));
-
-// SAFETY: Must be called by single thread.
-unsafe fn init_kb_sender(tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>) {
-    let kb_sender = unsafe { &mut *KB_PROC_SENDER.0.get() };
-    *kb_sender = MaybeUninit::new(tx);
+struct KbSender {
+    sender: MaybeUninit<SyncSender<(ClientEvent, SyncSender<ServerCommand>)>>,
 }
 
-// SAFETY: Must be called after channel was initialized.
-unsafe fn get_kb_sender() -> KbCh {
-    let ch_ptr = &*KB_PROC_SENDER.0.get();
-    let ch = ch_ptr.assume_init_ref().clone();
-    ch
+impl KbSender {
+    const fn new() -> Self {
+        Self {
+            sender: MaybeUninit::uninit(),
+        }
+    }
+    fn init(&mut self, tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>) {
+        self.sender.write(tx);
+    }
+
+    unsafe fn get(&self) -> &SyncSender<(ClientEvent, SyncSender<ServerCommand>)> {
+        unsafe { self.sender.assume_init_ref() }
+    }
 }
 
 unsafe extern "system" fn low_level_keyboard_proc(
@@ -181,7 +180,7 @@ unsafe extern "system" fn low_level_keyboard_proc(
         };
 
         let event = ClientEvent::Keyboard(kb_delta);
-        let tx = get_kb_sender();
+        let tx = KB_SENDER.get();
         let (command_tx, command_rx) = sync_channel(1);
         tx.send((event, command_tx))
             .expect("main thread must be around at this point");

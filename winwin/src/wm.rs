@@ -1,10 +1,11 @@
 use allocator_api2::vec::*;
+use std::hash::{Hash, Hasher};
+use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::{Win32::Foundation::*, Win32::Graphics::Gdi::*, Win32::System::Threading::*};
 use winwin_common::Rect;
-use std::hash::{Hash, Hasher};
 
-use crate::{Arena, Context};
+use crate::{Arena, Context, IteratorCollectWithAlloc};
 
 pub enum Direction {
     Left,
@@ -45,8 +46,16 @@ impl Window {
         if rect == Rect::default() {
             return;
         }
-        let res = unsafe {
-            SetWindowPos(
+
+        unsafe {
+            let _ = PostMessageA(
+                self.handle,
+                WM_SYSCOMMAND,
+                WPARAM(SC_RESTORE as _),
+                LPARAM(0),
+            );
+
+            let _ = SetWindowPos(
                 self.handle,
                 HWND::default(),
                 rect.x,
@@ -54,9 +63,8 @@ impl Window {
                 rect.width,
                 rect.height,
                 SWP_NOACTIVATE,
-            )
+            );
         };
-        assert!(res.is_ok());
     }
 
     pub fn is_on_monitor(&self, monitor: Monitor) -> bool {
@@ -107,28 +115,38 @@ impl Window {
     }
 
     pub fn maximize(&self) {
-        let err = unsafe {
-            PostMessageA(
+        unsafe {
+            let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
+            placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+            let _ = GetWindowPlacement(self.handle, &mut placement);
+
+            if placement.showCmd == SW_MAXIMIZE.0 as _ {
+                let _ = PostMessageA(
+                    self.handle,
+                    WM_SYSCOMMAND,
+                    WPARAM(SC_RESTORE as _),
+                    LPARAM(0),
+                );
+            }
+
+            let _ = PostMessageA(
                 self.handle,
                 WM_SYSCOMMAND,
                 WPARAM(SC_MAXIMIZE as _),
                 LPARAM(0),
             );
         };
-        tracing::warn!(?err);
     }
 
     pub fn minimize(&self) {
-        unsafe {
-            unsafe {
-                PostMessageA(
-                    self.handle,
-                    WM_SYSCOMMAND,
-                    WPARAM(SC_MINIMIZE as _),
-                    LPARAM(0),
-                );
-            }
-        }
+        let _ = unsafe {
+            PostMessageA(
+                self.handle,
+                WM_SYSCOMMAND,
+                WPARAM(SC_MINIMIZE as _),
+                LPARAM(0),
+            );
+        };
     }
 
     pub fn is_invalid(&self) -> bool {
@@ -252,6 +270,27 @@ pub fn get_all_monitors(ctx: &Context) -> Vec<Monitor, &Arena> {
     monitors
 }
 
+fn adjust_for_non_client_area(window: &Window, rect: Rect, scale: f64) -> Rect {
+    let window_rect = window.rect();
+    let client_rect = window.client_rect();
+    let border_width = ((window_rect.width - client_rect.width) / 2) as i32;
+    let title_height = (window_rect.height - client_rect.height - border_width) as i32;
+
+    Rect {
+        x: (rect.x as f64 / scale).round() as i32 - border_width,
+        y: (rect.y as f64 / scale).round() as i32 - title_height,
+        width: (rect.width as f64 / scale).round() as i32 + border_width * 2,
+        height: (rect.height as f64 / scale).round() as i32 + title_height + border_width,
+    }
+}
+
+fn get_dpi_for_monitor(monitor: Monitor) -> (u32, u32) {
+    let mut dpi_x = 0;
+    let mut dpi_y = 0;
+    let _ = unsafe { GetDpiForMonitor(monitor.handle, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+    (dpi_x, dpi_y)
+}
+
 #[derive(Default, Clone, Copy)]
 pub enum Layout {
     #[default]
@@ -263,7 +302,7 @@ pub enum Layout {
 
 pub fn apply_layout(ctx: &Context, monitor: Monitor, layout: Layout) {
     match layout {
-        Layout::None => {},
+        Layout::None => {}
         Layout::Stack => set_stack_layout(ctx, monitor),
         Layout::Grid => set_grid_layout(ctx, monitor),
         Layout::Full => set_full_layout(ctx, monitor),
@@ -277,48 +316,42 @@ fn set_stack_layout(ctx: &Context, monitor: Monitor) {
         0 => return,
         1 => set_full_layout(ctx, monitor),
         _ => {
-            let mut window_rects = Vec::with_capacity_in(windows.len(), &ctx.arena);
-            for window in windows.iter() {
-                window_rects.push(window.rect());
-            }
+            let bounding_rect = monitor.rect();
+            let (dpi_x, _) = get_dpi_for_monitor(monitor);
+            let scale = dpi_x as f64 / 96.0;
 
-            let monitor_rect = monitor.rect();
+            let partitions_needed = windows.len() as i32 - 1;
+            let partition_width = (bounding_rect.width as f64 / 2.0 / scale).round() as i32;
+            let partition_height =
+                (bounding_rect.height as f64 / partitions_needed as f64 / scale).round() as i32;
 
-            translate_rects_for_stack(monitor_rect, &windows, &mut window_rects);
+            let main_window = &windows[0];
+            let main_rect = adjust_for_non_client_area(
+                main_window,
+                Rect {
+                    x: bounding_rect.x,
+                    y: bounding_rect.y,
+                    width: partition_width,
+                    height: bounding_rect.height,
+                },
+                scale,
+            );
+            main_window.set_rect(main_rect.scale(scale));
 
-            for (window, rect) in windows.into_iter().zip(window_rects.into_iter()) {
-                window.set_rect(rect);
+            for (i, window) in windows[1..].iter().enumerate() {
+                let rect = adjust_for_non_client_area(
+                    window,
+                    Rect {
+                        x: bounding_rect.x + partition_width,
+                        y: bounding_rect.y + i as i32 * partition_height,
+                        width: partition_width,
+                        height: partition_height,
+                    },
+                    scale,
+                );
+                window.set_rect(rect.scale(scale));
             }
         }
-    }
-}
-
-fn translate_rects_for_stack(bounding_rect: Rect, windows: &[Window], rects: &mut [Rect]) {
-    let partitions_needed = windows.len() as i32 - 1;
-    let partition_width = bounding_rect.width / 2;
-    let partition_height = bounding_rect.height / partitions_needed;
-
-    let main_window = windows[0];
-    let main_style = main_window.style();
-    let main_toolbar_height = main_window.toolbar_height();
-    rects[0] = Rect {
-        x: bounding_rect.x,
-        y: bounding_rect.y + main_toolbar_height,
-        width: partition_width,
-        height: bounding_rect.height - main_toolbar_height,
-    }
-    .adjusted(main_style);
-
-    for (i, rect) in rects[1..].iter_mut().enumerate() {
-        let r = Rect {
-            x: bounding_rect.x + partition_width,
-            y: bounding_rect.y + i as i32 * partition_height + windows[i].toolbar_height(),
-            width: partition_width,
-            height: partition_height - windows[i].toolbar_height(),
-        };
-
-        let style = windows[i].style();
-        *rect = r.adjusted(style);
     }
 }
 
@@ -386,7 +419,8 @@ fn set_full_layout(ctx: &Context, monitor: Monitor) {
     let monitor_rect = monitor.rect();
     let windows = get_windows_on_monitor(ctx, monitor);
     for window in windows {
-        window.set_rect(monitor_rect);
+        window.maximize();
+        // window.set_rect(monitor_rect);
     }
 }
 

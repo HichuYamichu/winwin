@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::{alloc, ptr::NonNull};
+use allocator_api2::vec::Vec;
 
 pub use winwin_common::{Key, KeyState};
 
@@ -96,3 +97,36 @@ unsafe impl Allocator for &Arena {
         }
     }
 }
+
+
+pub trait FromIteratorWithAlloc<T, A: Allocator>: Sized {
+    fn from_iter_with_alloc<I: IntoIterator<Item = T>>(iter: I, alloc: A) -> Self;
+}
+
+impl<T, A: Allocator> FromIteratorWithAlloc<T, A> for Vec<T, A> {
+    fn from_iter_with_alloc<I: IntoIterator<Item = T>>(iter: I, alloc: A) -> Self {
+        let iter = iter.into_iter();
+        let mut my_vec = Vec::with_capacity_in(iter.size_hint().0, alloc);
+
+        for item in iter {
+            my_vec.push(item);
+        }
+
+        my_vec
+    }
+}
+
+pub trait IteratorCollectWithAlloc: Iterator {
+    fn collect_with<T, A, C>(self, alloc: A) -> C
+    where
+        Self: Sized + IntoIterator<Item = T>,
+        C: FromIteratorWithAlloc<T, A>,
+        A: Allocator,
+    {
+        C::from_iter_with_alloc(self, alloc)
+    }
+}
+
+// Implement the IteratorCollectWithAlloc for all iterators
+impl<I: Iterator> IteratorCollectWithAlloc for I {}
+

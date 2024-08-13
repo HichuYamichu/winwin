@@ -118,6 +118,15 @@ impl Rect {
         unsafe { AdjustWindowRect(&mut r as *mut _, style, false).unwrap() };
         r.into()
     }
+
+    pub fn scale(&self, scale: f64) -> Rect {
+        Rect {
+            x: (self.x as f64 * scale).round() as i32,
+            y: (self.y as f64 * scale).round() as i32,
+            width: (self.width as f64 * scale).round() as i32,
+            height: (self.height as f64 * scale).round() as i32,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
