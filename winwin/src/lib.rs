@@ -1,10 +1,12 @@
 use allocator_api2::alloc::AllocError;
 use allocator_api2::alloc::Allocator;
-use std::cell::Cell;
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::{alloc, ptr::NonNull};
 use allocator_api2::vec::Vec;
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::mem::MaybeUninit;
+use std::{alloc, ptr::NonNull};
 
 pub use winwin_common::{Key, KeyState};
 
@@ -14,15 +16,36 @@ pub use events::*;
 mod wm;
 pub use wm::*;
 
+#[macro_export]
+macro_rules! error_if_err {
+    ($result:expr) => {
+        if let Err(e) = $result {
+            tracing::error!(error = ?e);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! error_if {
+    ($failed:expr) => {
+        if $failed.as_bool() {
+            let e = windows::core::Error::from_win32();
+            tracing::error!(error = ?e);
+        }
+    };
+}
+
 pub struct Context {
     // Arena allocator for temporary (frame) allocations.
     arena: Arena,
+    pub memory: Memory,
 }
 
 impl Context {
     pub fn new() -> Self {
         Self {
-            arena: Arena::new_unbounded(),
+            arena: Arena::new_with_global_alloc(),
+            memory: Memory::default(),
         }
     }
 }
@@ -35,8 +58,8 @@ pub struct Arena {
 }
 
 impl Arena {
-    pub fn new_unbounded() -> Self {
-        // Overallocate. Commited memory should never be this high unless there was a leak.
+    pub fn new_with_global_alloc() -> Self {
+        // Reserve 4GB, commit as needed.
         let size = u32::MAX as usize;
         let layout = alloc::Layout::array::<u8>(size).expect("arguments are correct");
         let mem = unsafe { alloc::alloc(layout) };
@@ -53,6 +76,20 @@ impl Arena {
     pub fn reset(&self) {
         self.end.set(0);
         self.used.set(0);
+    }
+
+    pub fn slice_uninit<'a, T: Sized>(&'a self, size: usize) -> &'a [MaybeUninit<T>] {
+        let layout = alloc::Layout::array::<T>(size).unwrap();
+        let ptr = self.allocate(layout).unwrap();
+        let s = unsafe { std::slice::from_raw_parts(ptr.cast().as_ptr(), size) };
+        s
+    }
+
+    pub fn slice_mut_uninit<'a, T: Sized>(&'a self, size: usize) -> &'a mut [MaybeUninit<T>] {
+        let layout = alloc::Layout::array::<T>(size).unwrap();
+        let ptr = self.allocate(layout).unwrap();
+        let s = unsafe { std::slice::from_raw_parts_mut(ptr.cast().as_ptr(), size) };
+        s
     }
 }
 
@@ -98,7 +135,6 @@ unsafe impl Allocator for &Arena {
     }
 }
 
-
 pub trait FromIteratorWithAlloc<T, A: Allocator>: Sized {
     fn from_iter_with_alloc<I: IntoIterator<Item = T>>(iter: I, alloc: A) -> Self;
 }
@@ -127,6 +163,22 @@ pub trait IteratorCollectWithAlloc: Iterator {
     }
 }
 
-// Implement the IteratorCollectWithAlloc for all iterators
 impl<I: Iterator> IteratorCollectWithAlloc for I {}
 
+#[derive(Default)]
+pub struct Memory {
+    monitor_layouts: RefCell<HashMap<Monitor, Layout>>,
+    window_queues: RefCell<HashMap<Monitor, VecDeque<Window>>>,
+}
+
+impl Memory {
+    pub fn remember_layout(&self, monitor: Monitor, layout: Layout) {
+        let mut monitor_layouts = self.monitor_layouts.borrow_mut();
+        monitor_layouts.insert(monitor, layout);
+    }
+
+    pub fn layout_on(&self, monitor: Monitor) -> Layout {
+        let monitor_layouts = self.monitor_layouts.borrow();
+        *monitor_layouts.get(&monitor).unwrap_or(&Layout::None)
+    }
+}

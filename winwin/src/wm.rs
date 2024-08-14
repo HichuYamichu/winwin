@@ -1,11 +1,12 @@
 use allocator_api2::vec::*;
 use std::hash::{Hash, Hasher};
+use std::mem::MaybeUninit;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::{Win32::Foundation::*, Win32::Graphics::Gdi::*, Win32::System::Threading::*};
 use winwin_common::Rect;
 
-use crate::{Arena, Context, IteratorCollectWithAlloc};
+use crate::{error_if, error_if_err, Arena, Context, IteratorCollectWithAlloc};
 
 pub enum Direction {
     Left,
@@ -38,24 +39,28 @@ impl Window {
         }
     }
 
-    pub fn toolbar_height(&self) -> i32 {
-        32
-    }
-
     pub fn set_rect(&self, rect: Rect) {
         if rect == Rect::default() {
             return;
         }
 
         unsafe {
-            let _ = PostMessageA(
-                self.handle,
-                WM_SYSCOMMAND,
-                WPARAM(SC_RESTORE as _),
-                LPARAM(0),
-            );
+            let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
+            placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+            let res = GetWindowPlacement(self.handle, &mut placement);
+            error_if_err!(res);
 
-            let _ = SetWindowPos(
+            if placement.showCmd == SW_MAXIMIZE.0 as _ {
+                let res = PostMessageA(
+                    self.handle,
+                    WM_SYSCOMMAND,
+                    WPARAM(SC_RESTORE as _),
+                    LPARAM(0),
+                );
+                error_if_err!(res);
+            }
+
+            let res = SetWindowPos(
                 self.handle,
                 HWND::default(),
                 rect.x,
@@ -64,35 +69,32 @@ impl Window {
                 rect.height,
                 SWP_NOACTIVATE,
             );
+            error_if_err!(res);
         };
     }
 
     pub fn is_on_monitor(&self, monitor: Monitor) -> bool {
-        let wr = self.rect();
-        let intersection = wr.intersection(&monitor.rect());
-
-        let window_area = wr.area();
-        let intersect_area = intersection.area();
-
-        let overlap = intersect_area as f32 / window_area as f32;
-        overlap >= 0.5
+        let target_handle = unsafe { MonitorFromWindow(self.handle, MONITOR_DEFAULTTONULL) };
+        return target_handle == monitor.handle;
     }
 
-    // Only for debug purposes.
     pub fn title(&self) -> String {
-        let mut buff = [0; 255];
-        unsafe { GetWindowTextW(self.handle, &mut buff) };
-        String::from_utf16_lossy(&buff)
+        let mut buff = [0; 512];
+        let end = unsafe { GetWindowTextW(self.handle, &mut buff) };
+        String::from_utf16_lossy(&buff[..end as usize])
     }
 
     pub fn info(&self) -> WindowInfo {
+        if self.is_invalid() {
+            todo!()
+        }
+
         let mut info = WINDOWINFO {
             cbSize: core::mem::size_of::<WINDOWINFO>() as u32,
             ..Default::default()
         };
         let res = unsafe { GetWindowInfo(self.handle, &mut info) };
-        // TODO: Handle can be null.
-        assert!(res.is_ok());
+        error_if_err!(res);
 
         todo!()
     }
@@ -102,15 +104,25 @@ impl Window {
         WINDOW_STYLE(style as _)
     }
 
+    pub fn style_ex(&self) -> WINDOW_EX_STYLE {
+        let style = unsafe { GetWindowLongW(self.handle, GWL_EXSTYLE) };
+        WINDOW_EX_STYLE(style as _)
+    }
+
     pub fn focus(&self) {
         unsafe {
             let current_thread_id = GetCurrentThreadId();
             let foreground_thread_id = GetWindowThreadProcessId(GetForegroundWindow(), None);
-            let _ = AttachThreadInput(current_thread_id, foreground_thread_id, TRUE);
-            let _ = BringWindowToTop(self.handle);
-            let _ = ShowWindow(self.handle, SW_SHOW);
-            let _ = SetForegroundWindow(self.handle);
-            let _ = AttachThreadInput(current_thread_id, foreground_thread_id, FALSE);
+            let success = AttachThreadInput(current_thread_id, foreground_thread_id, TRUE);
+            error_if!(!success);
+
+            error_if_err!(BringWindowToTop(self.handle));
+
+            let _was_visible = ShowWindow(self.handle, SW_SHOW);
+            let _was_set = SetForegroundWindow(self.handle);
+
+            let success = AttachThreadInput(current_thread_id, foreground_thread_id, FALSE);
+            error_if!(!success);
         };
     }
 
@@ -118,35 +130,39 @@ impl Window {
         unsafe {
             let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
             placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-            let _ = GetWindowPlacement(self.handle, &mut placement);
+            let res = GetWindowPlacement(self.handle, &mut placement);
+            error_if_err!(res);
 
             if placement.showCmd == SW_MAXIMIZE.0 as _ {
-                let _ = PostMessageA(
+                let res = PostMessageA(
                     self.handle,
                     WM_SYSCOMMAND,
                     WPARAM(SC_RESTORE as _),
                     LPARAM(0),
                 );
+                error_if_err!(res);
             }
 
-            let _ = PostMessageA(
+            let res = PostMessageA(
                 self.handle,
                 WM_SYSCOMMAND,
                 WPARAM(SC_MAXIMIZE as _),
                 LPARAM(0),
             );
+            error_if_err!(res);
         };
     }
 
     pub fn minimize(&self) {
-        let _ = unsafe {
+        let res = unsafe {
             PostMessageA(
                 self.handle,
                 WM_SYSCOMMAND,
                 WPARAM(SC_MINIMIZE as _),
                 LPARAM(0),
-            );
+            )
         };
+        error_if_err!(res);
     }
 
     pub fn is_invalid(&self) -> bool {
@@ -174,7 +190,8 @@ pub fn get_all_windows(ctx: &Context) -> Vec<Window, &Arena> {
                 cbSize: core::mem::size_of::<WINDOWINFO>() as u32,
                 ..Default::default()
             };
-            let _ = GetWindowInfo(window, &mut info);
+            let res = GetWindowInfo(window, &mut info);
+            error_if_err!(res);
 
             if len != 0 && info.dwStyle.contains(WS_VISIBLE) && !info.dwStyle.contains(WS_POPUP) {
                 let dest_vec = lparam.0 as *mut Vec<Window, &Arena>;
@@ -192,9 +209,13 @@ pub fn get_all_windows(ctx: &Context) -> Vec<Window, &Arena> {
             LPARAM(&mut windows as *mut _ as isize),
         )
     };
-    assert!(res.is_ok());
-
-    windows
+    match res {
+        Ok(_) => windows,
+        Err(e) => {
+            tracing::error!(error = ?e);
+            Vec::new_in(&ctx.arena)
+        }
+    }
 }
 
 pub fn is_minimised(window: Window) -> bool {
@@ -213,8 +234,8 @@ impl Monitor {
             ..Default::default()
         };
 
-        let success = unsafe { GetMonitorInfoW(self.handle, &mut info).as_bool() };
-        assert!(success);
+        let success = unsafe { GetMonitorInfoW(self.handle, &mut info) };
+        error_if!(!success);
         info.rcWork.into()
     }
 }
@@ -256,31 +277,33 @@ pub fn get_all_monitors(ctx: &Context) -> Vec<Monitor, &Arena> {
     }
 
     let mut monitors = Vec::new_in(&ctx.arena);
-    let success: bool = unsafe {
+    let success = unsafe {
         EnumDisplayMonitors(
             HDC(std::ptr::null_mut()),
             None,
             Some(push_monitor),
             LPARAM(&mut monitors as *mut _ as isize),
         )
-        .into()
     };
-    assert!(success);
+    error_if!(!success);
 
     monitors
 }
 
-fn adjust_for_non_client_area(window: &Window, rect: Rect, scale: f64) -> Rect {
-    let window_rect = window.rect();
-    let client_rect = window.client_rect();
+fn adjust_for_non_client_area(
+    target_rect: Rect,
+    window_rect: Rect,
+    client_rect: Rect,
+    scale: f64,
+) -> Rect {
     let border_width = ((window_rect.width - client_rect.width) / 2) as i32;
     let title_height = (window_rect.height - client_rect.height - border_width) as i32;
 
     Rect {
-        x: (rect.x as f64 / scale).round() as i32 - border_width,
-        y: (rect.y as f64 / scale).round() as i32 - title_height,
-        width: (rect.width as f64 / scale).round() as i32 + border_width * 2,
-        height: (rect.height as f64 / scale).round() as i32 + title_height + border_width,
+        x: (target_rect.x as f64 / scale).round() as i32 - border_width,
+        y: (target_rect.y as f64 / scale).round() as i32 - title_height,
+        width: (target_rect.width as f64 / scale).round() as i32 + border_width * 2,
+        height: (target_rect.height as f64 / scale).round() as i32 + title_height + border_width,
     }
 }
 
@@ -301,6 +324,7 @@ pub enum Layout {
 }
 
 pub fn apply_layout(ctx: &Context, monitor: Monitor, layout: Layout) {
+    ctx.memory.remember_layout(monitor, layout);
     match layout {
         Layout::None => {}
         Layout::Stack => set_stack_layout(ctx, monitor),
@@ -320,39 +344,87 @@ fn set_stack_layout(ctx: &Context, monitor: Monitor) {
             let (dpi_x, _) = get_dpi_for_monitor(monitor);
             let scale = dpi_x as f64 / 96.0;
 
-            let partitions_needed = windows.len() as i32 - 1;
-            let partition_width = (bounding_rect.width as f64 / 2.0 / scale).round() as i32;
-            let partition_height =
-                (bounding_rect.height as f64 / partitions_needed as f64 / scale).round() as i32;
+            let windows_rect: Vec<Rect, &Arena> =
+                windows.iter().map(|w| w.rect()).collect_with(&ctx.arena);
+            let windows_client_rect: Vec<Rect, &Arena> = windows
+                .iter()
+                .map(|w| w.client_rect())
+                .collect_with(&ctx.arena);
+            let transformed_rects = ctx.arena.slice_mut_uninit::<Rect>(windows.len());
 
-            let main_window = &windows[0];
-            let main_rect = adjust_for_non_client_area(
-                main_window,
-                Rect {
-                    x: bounding_rect.x,
-                    y: bounding_rect.y,
-                    width: partition_width,
-                    height: bounding_rect.height,
-                },
+            transform_rects_for_stack_uninit(
+                bounding_rect,
                 scale,
+                &windows_rect,
+                &windows_client_rect,
+                transformed_rects,
             );
-            main_window.set_rect(main_rect.scale(scale));
+            // let t: &mut [Rect] = unsafe { std::mem::transmute(transformed_rects) };
+            // dbg!(&t);
 
-            for (i, window) in windows[1..].iter().enumerate() {
-                let rect = adjust_for_non_client_area(
-                    window,
-                    Rect {
-                        x: bounding_rect.x + partition_width,
-                        y: bounding_rect.y + i as i32 * partition_height,
-                        width: partition_width,
-                        height: partition_height,
-                    },
-                    scale,
-                );
-                window.set_rect(rect.scale(scale));
+            for (window, rect) in windows.iter().zip(transformed_rects.iter()) {
+                window.set_rect(unsafe { rect.assume_init() });
             }
         }
     }
+}
+
+pub fn transform_rects_for_stack_uninit(
+    bounding_rect: Rect,
+    scale: f64,
+    windows_rect: &[Rect],
+    windows_client_rect: &[Rect],
+    transformed_rects: &mut [MaybeUninit<Rect>],
+) {
+    let partitions_needed = windows_rect.len() as i32 - 1;
+    let partition_width = (bounding_rect.width as f64 / 2.0 / scale).round() as i32;
+    let partition_height =
+        (bounding_rect.height as f64 / partitions_needed as f64 / scale).round() as i32;
+
+    let main_rect = adjust_for_non_client_area(
+        Rect {
+            x: bounding_rect.x,
+            y: bounding_rect.y,
+            width: partition_width,
+            height: bounding_rect.height,
+        },
+        windows_rect[0],
+        windows_client_rect[0],
+        scale,
+    );
+    transformed_rects[0].write(main_rect.scale(scale));
+
+    for i in 1..windows_rect.len() {
+        let sub_window_idx = i - 1;
+        let rect = adjust_for_non_client_area(
+            Rect {
+                x: bounding_rect.x + partition_width,
+                y: bounding_rect.y + sub_window_idx as i32 * partition_height,
+                width: partition_width,
+                height: partition_height,
+            },
+            windows_rect[i],
+            windows_client_rect[i],
+            scale,
+        );
+        transformed_rects[i].write(rect.scale(scale));
+    }
+}
+
+pub fn transform_rects_for_stack(
+    bounding_rect: Rect,
+    scale: f64,
+    windows_rect: &[Rect],
+    windows_client_rect: &[Rect],
+    transformed_rects: &mut [Rect],
+) {
+    transform_rects_for_stack_uninit(
+        bounding_rect,
+        scale,
+        windows_rect,
+        windows_client_rect,
+        unsafe { std::mem::transmute(transformed_rects) },
+    )
 }
 
 fn set_grid_layout(ctx: &Context, monitor: Monitor) {
@@ -362,65 +434,104 @@ fn set_grid_layout(ctx: &Context, monitor: Monitor) {
         0 => return,
         1 => set_full_layout(ctx, monitor),
         _ => {
-            let mut window_rects = Vec::with_capacity_in(windows.len(), &ctx.arena);
-            for window in windows.iter() {
-                window_rects.push(window.rect());
-            }
+            let (dpi_x, _) = get_dpi_for_monitor(monitor);
+            let scale = dpi_x as f64 / 96.0;
+            let bounding_rect = monitor.rect();
 
-            let monitor_rect = monitor.rect();
+            let windows_rect: Vec<Rect, &Arena> =
+                windows.iter().map(|w| w.rect()).collect_with(&ctx.arena);
+            let windows_client_rect: Vec<Rect, &Arena> = windows
+                .iter()
+                .map(|w| w.client_rect())
+                .collect_with(&ctx.arena);
+            let transformed_rects = ctx.arena.slice_mut_uninit::<Rect>(windows.len());
 
-            translate_rects_for_grid(monitor_rect, &windows, &mut window_rects);
+            transform_rects_for_grid_uninit(
+                bounding_rect,
+                scale,
+                &windows_rect,
+                &windows_client_rect,
+                transformed_rects,
+            );
 
-            for (window, rect) in windows.into_iter().zip(window_rects.into_iter()) {
-                window.set_rect(rect);
+            for (window, rect) in windows.iter().zip(transformed_rects.iter()) {
+                window.set_rect(unsafe { rect.assume_init() });
             }
         }
     }
 }
 
-fn translate_rects_for_grid(bounding_rect: Rect, windows: &[Window], rects: &mut [Rect]) {
-    let window_count = windows.len() as i32;
-    let rows = (window_count as f32).sqrt().ceil() as i32;
-    let cols = (window_count + rows - 1) / rows;
+fn transform_rects_for_grid_uninit(
+    bounding_rect: Rect,
+    scale: f64,
+    windows_rect: &[Rect],
+    windows_client_rect: &[Rect],
+    transformed_rects: &mut [MaybeUninit<Rect>],
+) {
+    let window_count = windows_rect.len();
+    let rows = (window_count as f32).sqrt().ceil() as u32;
+    let cols = (window_count as u32 + rows - 1) / rows;
 
-    let cell_width = bounding_rect.width / cols;
-    let cell_height = bounding_rect.height / rows;
+    let cell_width = bounding_rect.width / cols as i32;
+    let cell_height = bounding_rect.height / rows as i32;
 
-    for (i, (rect, window)) in rects.iter_mut().zip(windows.iter()).enumerate() {
-        let row = i as i32 / cols;
-        let col = i as i32 % cols;
+    let fixup = window_count % 2;
+    for i in 0..window_count as usize - fixup {
+        let row = i as u32 / cols;
+        let col = i as u32 % cols;
 
-        let is_last_odd = i == window_count as usize - 1 && window_count % 2 == 1;
+        let rect = adjust_for_non_client_area(
+            Rect {
+                x: bounding_rect.x + (col * cell_width as u32) as i32,
+                y: bounding_rect.y + (row * cell_height as u32) as i32,
+                width: cell_width,
+                height: cell_height,
+            },
+            windows_rect[i],
+            windows_client_rect[i],
+            scale,
+        );
+        transformed_rects[i].write(rect);
+    }
 
-        let title_bar_height = window.toolbar_height();
-        let style = window.style();
-
-        let r = if is_last_odd {
+    if fixup != 0 {
+        let last_idx = window_count - 1;
+        let row = last_idx as i32 / cols as i32;
+        let rect = adjust_for_non_client_area(
             Rect {
                 x: bounding_rect.x,
-                y: bounding_rect.y + row * cell_height + title_bar_height,
+                y: bounding_rect.y + row * cell_height,
                 width: bounding_rect.width,
-                height: cell_height - title_bar_height,
-            }
-        } else {
-            Rect {
-                x: bounding_rect.x + col * cell_width,
-                y: bounding_rect.y + row * cell_height + title_bar_height,
-                width: cell_width,
-                height: cell_height - title_bar_height,
-            }
-        };
-
-        *rect = r.adjusted(style);
+                height: cell_height,
+            },
+            windows_rect[last_idx],
+            windows_client_rect[last_idx],
+            scale,
+        );
+        transformed_rects[last_idx].write(rect);
     }
 }
 
+pub fn transform_rects_for_grid(
+    bounding_rect: Rect,
+    scale: f64,
+    windows_rect: &[Rect],
+    windows_client_rect: &[Rect],
+    transformed_rects: &mut [Rect],
+) {
+    transform_rects_for_grid_uninit(
+        bounding_rect,
+        scale,
+        windows_rect,
+        windows_client_rect,
+        unsafe { std::mem::transmute(transformed_rects) },
+    )
+}
+
 fn set_full_layout(ctx: &Context, monitor: Monitor) {
-    let monitor_rect = monitor.rect();
     let windows = get_windows_on_monitor(ctx, monitor);
     for window in windows {
         window.maximize();
-        // window.set_rect(monitor_rect);
     }
 }
 
@@ -433,16 +544,67 @@ pub fn move_focus(ctx: &Context, direction: Direction) {
     }
 }
 
+pub fn swap(w1: Window, w2: Window) {
+    let w1_rect = w1.rect();
+    let w2_rect = w2.rect();
+
+    w1.set_rect(w2_rect);
+    w2.set_rect(w1_rect);
+}
+
 pub fn swap_adjacent(ctx: &Context, window: Window, direction: Direction) {
     let other = get_adjacent(ctx, window, direction);
 
     if let Some(other) = other {
-        let base_rect = window.rect();
-        let other_rect = other.rect();
-
-        window.set_rect(other_rect);
-        other.set_rect(base_rect);
+        swap(window, other);
     }
+}
+
+pub fn send(ctx: &Context, window: Window, monitor: Monitor) {
+    let layout = ctx.memory.layout_on(monitor);
+    let mut windows = get_windows_on_monitor(ctx, monitor);
+    windows.push(window);
+
+    let windows_rect: Vec<Rect, &Arena> = windows.iter().map(|w| w.rect()).collect_with(&ctx.arena);
+    let windows_client_rect: Vec<Rect, &Arena> = windows
+        .iter()
+        .map(|w| w.client_rect())
+        .collect_with(&ctx.arena);
+    let transformed_rects = ctx.arena.slice_mut_uninit::<Rect>(windows.len());
+    let bounding_rect = monitor.rect();
+    let (dpi_x, _) = get_dpi_for_monitor(monitor);
+    let scale = dpi_x as f64 / 96.0;
+
+    match layout {
+        Layout::None => {}
+        Layout::Stack => {
+            transform_rects_for_stack_uninit(
+                bounding_rect,
+                scale,
+                &windows_rect,
+                &windows_client_rect,
+                transformed_rects,
+            );
+        }
+        Layout::Full => {}
+        Layout::Grid => {}
+    }
+
+    for (window, rect) in windows.iter().zip(transformed_rects.iter()) {
+        window.set_rect(unsafe { rect.assume_init() });
+    }
+}
+
+pub fn send_in(window: Window, direction: Direction) {
+    todo!()
+}
+
+pub fn swap_or_send(window: Window, direction: Direction) {
+    todo!()
+}
+
+pub fn swap_monitors(m1: Monitor, m2: Monitor) {
+    todo!()
 }
 
 pub fn get_adjacent(ctx: &Context, window: Window, direction: Direction) -> Option<Window> {
@@ -471,4 +633,26 @@ pub fn get_adjacent(ctx: &Context, window: Window, direction: Direction) -> Opti
     });
 
     candidate_windows.first().map(|(w, _)| **w)
+}
+
+pub fn get_adjacent_monitor(ctx: &Context, monitor: Monitor, direction: Direction) {
+    todo!()
+}
+
+pub fn kill_window(window: Window) {
+    if window.is_invalid() {
+        return;
+    }
+
+    let res = unsafe { PostMessageA(window.handle, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    error_if_err!(res);
+}
+
+pub fn kill_all_windows(ctx: &Context) {
+    let windows = get_all_windows(ctx);
+
+    for window in windows {
+        let res = unsafe { PostMessageA(window.handle, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        error_if_err!(res);
+    }
 }

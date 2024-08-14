@@ -113,12 +113,6 @@ impl Rect {
         Point { x, y }
     }
 
-    pub fn adjusted(&self, style: WINDOW_STYLE) -> Self {
-        let mut r = RECT::from(*self);
-        unsafe { AdjustWindowRect(&mut r as *mut _, style, false).unwrap() };
-        r.into()
-    }
-
     pub fn scale(&self, scale: f64) -> Rect {
         Rect {
             x: (self.x as f64 * scale).round() as i32,

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use tracing::Level;
 use winwin::*;
 
@@ -19,7 +17,6 @@ fn main() {
     let mod_key = Key::AltLeft;
     let mut queue = EventQueue::new();
     let ctx = Context::new();
-    let mut monitor_configs = HashMap::new();
 
     loop {
         let event = queue.next_event(&ctx);
@@ -68,36 +65,50 @@ fn main() {
                 if input.all_pressed(&[mod_key, Key::Q]) {
                     let monitor = get_focused_monitor();
                     apply_layout(&ctx, monitor, Layout::Stack);
-                    monitor_configs.insert(monitor, Layout::Stack);
                 }
 
                 if input.all_pressed(&[mod_key, Key::W]) {
                     let monitor = get_focused_monitor();
                     apply_layout(&ctx, monitor, Layout::Full);
-                    monitor_configs.insert(monitor, Layout::Full);
                 }
 
                 if input.all_pressed(&[mod_key, Key::E]) {
                     let monitor = get_focused_monitor();
                     apply_layout(&ctx, monitor, Layout::Grid);
-                    monitor_configs.insert(monitor, Layout::Grid);
                 }
 
                 if input.all_pressed(&[mod_key, Key::R]) {
                     let monitor = get_focused_monitor();
                     apply_layout(&ctx, monitor, Layout::None);
-                    monitor_configs.insert(monitor, Layout::None);
+                }
+
+                // Moving windows across monitors.
+                if input.all_pressed(&[mod_key, Key::Right]) {
+                    tracing::debug!("send");
+                    let window = get_focused_window();
+                    let monitors = get_all_monitors(&ctx);
+                    send(&ctx, window, monitors[2]);
+                }
+
+                // Window closing.
+                if input.all_pressed(&[mod_key, Key::BackSlash]) {
+                    let window = get_focused_window();
+                    kill_window(window);
+                }
+
+                if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::BackSlash]) {
+                    kill_all_windows(&ctx);
                 }
             }
             Event::WindowOpen(window) => {
                 let monitor = get_monitor_with_window(window);
-                let layout = monitor_configs.get(&monitor).unwrap_or(&Layout::None);
-                apply_layout(&ctx, monitor, *layout);
+                let layout = ctx.memory.layout_on(monitor);
+                apply_layout(&ctx, monitor, layout);
             }
             Event::WindowClose(window) => {
                 let monitor = get_monitor_with_window(window);
-                let layout = monitor_configs.get(&monitor).unwrap_or(&Layout::None);
-                apply_layout(&ctx, monitor, *layout);
+                let layout = ctx.memory.layout_on(monitor);
+                apply_layout(&ctx, monitor, layout);
             }
         }
     }

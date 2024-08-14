@@ -120,6 +120,8 @@ pub enum Key {
     Minus,
     Period,
 
+    BackSlash,
+
     Unknown,
 }
 
@@ -242,6 +244,7 @@ impl Key {
             0xBC => Self::Comma,
             0xBD => Self::Minus,
             0xBE => Self::Period,
+            0xDC => Self::BackSlash,
             _ => Self::Unknown,
         }
     }
