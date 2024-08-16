@@ -15,8 +15,10 @@ fn main() {
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let mod_key = Key::AltLeft;
-    let mut queue = EventQueue::new();
-    let ctx = Context::new();
+    // SAFETY: There can be only one `EventQueue` at a time and it must be pulled for events or shutdown.
+    // This is the only place and time where `EventQueue` is constructed and we pool right after so
+    // this is safe and correct.
+    let (mut queue, ctx) = unsafe { EventQueue::new() };
 
     loop {
         let event = queue.next_event(&ctx);
@@ -84,10 +86,8 @@ fn main() {
 
                 // Moving windows across monitors.
                 if input.all_pressed(&[mod_key, Key::Right]) {
-                    tracing::debug!("send");
                     let window = get_focused_window();
-                    let monitors = get_all_monitors(&ctx);
-                    send(&ctx, window, monitors[2]);
+                    send_in(&ctx, window, Direction::Right);
                 }
 
                 // Window closing.
@@ -101,15 +101,16 @@ fn main() {
                 }
             }
             Event::WindowOpen(window) => {
-                let monitor = get_monitor_with_window(window);
-                let layout = ctx.memory.layout_on(monitor);
+                let monitor = get_monitor_with_window(&ctx, window);
+                let layout = ctx.cache.layout_on(monitor);
                 apply_layout(&ctx, monitor, layout);
             }
             Event::WindowClose(window) => {
-                let monitor = get_monitor_with_window(window);
-                let layout = ctx.memory.layout_on(monitor);
+                let monitor = get_monitor_with_window(&ctx, window);
+                let layout = ctx.cache.layout_on(monitor);
                 apply_layout(&ctx, monitor, layout);
             }
+            // TODO: Handle monitor connection/disconection.
         }
     }
 }

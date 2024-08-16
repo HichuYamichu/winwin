@@ -3,6 +3,8 @@ use allocator_api2::alloc::Allocator;
 use allocator_api2::vec::Vec;
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::cell::UnsafeCell;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
@@ -36,16 +38,28 @@ macro_rules! error_if {
 }
 
 pub struct Context {
-    // Arena allocator for temporary (frame) allocations.
+    // Arena allocator for temporary (on event) allocations.
     arena: Arena,
-    pub memory: Memory,
+    pub cache: Cache,
 }
 
 impl Context {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
+        let arena = Arena::new_with_global_alloc();
+        let monitors = wm::get_all_monitors_live(&arena);
+
+        let mut map = HashMap::with_capacity(monitors.len());
+        let windows = wm::get_all_windows_live(&arena);
+
+        for monitor in monitors {
+            let windows_on_monitor = windows.iter().filter(|w| w.is_on_monitor(monitor));
+            let vd = VecDeque::from_iter(windows_on_monitor);
+            map.insert(monitor, vd);
+        }
+
         Self {
-            arena: Arena::new_with_global_alloc(),
-            memory: Memory::default(),
+            arena,
+            cache: Cache::new(map),
         }
     }
 }
@@ -166,12 +180,19 @@ pub trait IteratorCollectWithAlloc: Iterator {
 impl<I: Iterator> IteratorCollectWithAlloc for I {}
 
 #[derive(Default)]
-pub struct Memory {
+pub struct Cache {
     monitor_layouts: RefCell<HashMap<Monitor, Layout>>,
-    window_queues: RefCell<HashMap<Monitor, VecDeque<Window>>>,
+    window_queues: UnsafeCell<HashMap<Monitor, VecDeque<Window>>>,
 }
 
-impl Memory {
+impl Cache {
+    pub fn new(precache: HashMap<Monitor, VecDeque<Window>>) -> Self {
+        Self {
+            monitor_layouts: RefCell::default(),
+            window_queues: UnsafeCell::new(precache),
+        }
+    }
+
     pub fn remember_layout(&self, monitor: Monitor, layout: Layout) {
         let mut monitor_layouts = self.monitor_layouts.borrow_mut();
         monitor_layouts.insert(monitor, layout);
@@ -180,5 +201,92 @@ impl Memory {
     pub fn layout_on(&self, monitor: Monitor) -> Layout {
         let monitor_layouts = self.monitor_layouts.borrow();
         *monitor_layouts.get(&monitor).unwrap_or(&Layout::None)
+    }
+
+    pub(crate) fn update_queue(&self, monitor: Monitor, window: Window) {
+        // SAFETY: There are no outstanding references to inner data because we do not hand out any
+        // and do not retain any.
+        let queues = unsafe { &mut *self.window_queues.get() };
+
+        let entry = queues.entry(monitor);
+        match entry {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(e) => {
+                // There was no cache entry for this monitor so we only need to create one.
+                e.insert(VecDeque::from([window]));
+                return;
+            }
+        };
+
+        // There are three cases:
+        // 1. Window was not present in any queue and must be added.
+        // 2. Window was in different queue and must be moved.
+        // 3. Windows was in correct queue but must be moved to the front.
+        // Looping unconditionaly saves us from figuring out which case we were in. Instead we just
+        // add to correct queue once we know that window does not exist elsewhere.
+        for q in queues.values_mut() {
+            q.retain(|w| *w != window);
+        }
+        let queue = queues
+            .get_mut(&monitor)
+            .expect("if we got here queue must exist");
+        queue.push_front(window);
+        dbg!(&queues);
+    }
+
+    pub(crate) fn monitor_with_window(&self, window: Window) -> Monitor {
+        // SAFETY: There are no outstanding references to inner data because we do not hand out any
+        // and do not retain any.
+        let queues = unsafe { &*self.window_queues.get() };
+        for (k, q) in queues.iter() {
+            if q.contains(&window) {
+                return *k;
+            }
+        }
+
+        Monitor::default()
+    }
+
+    pub(crate) fn windows_on_monitor<'a>(
+        &self,
+        ctx: &'a Context,
+        monitor: Monitor,
+    ) -> Vec<Window, &'a Arena> {
+        // SAFETY: There are no outstanding references to inner data because we do not hand out any
+        // and do not retain any.
+        let queues = unsafe { &*self.window_queues.get() };
+        queues
+            .get(&monitor)
+            .unwrap_or(&VecDeque::new())
+            .iter()
+            .copied()
+            .collect_with(&ctx.arena)
+    }
+
+    pub(crate) fn monitors<'a>(&self, ctx: &'a Context) -> Vec<Monitor, &'a Arena> {
+        // SAFETY: There are no outstanding references to inner data because we do not hand out any
+        // and do not retain any.
+        let queues = unsafe { &*self.window_queues.get() };
+        queues.keys().copied().collect_with(&ctx.arena)
+    }
+
+    pub(crate) fn windows<'a>(&self, ctx: &'a Context) -> Vec<Window, &'a Arena> {
+        // SAFETY: There are no outstanding references to inner data because we do not hand out any
+        // and do not retain any.
+        let queues = unsafe { &*self.window_queues.get() };
+        queues
+            .values()
+            .map(|q| q.iter())
+            .flatten()
+            .copied()
+            .collect_with(&ctx.arena)
+    }
+
+    pub(crate) fn focused_monitor(&self) -> Monitor {
+        todo!()
+    }
+
+    pub(crate) fn focused_window(&self) -> Window {
+        todo!()
     }
 }

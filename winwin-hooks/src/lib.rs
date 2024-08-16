@@ -79,22 +79,22 @@ pub unsafe extern "system" fn shell_proc(code: i32, wparam: WPARAM, lparam: LPAR
         }
     }
 
+    if code == HSHELL_MONITORCHANGED as _ {
+        let hwnd = HWND(wparam.0 as _);
+
+        if is_real_window(hwnd) {
+            let event = ClientEvent::WindowMonitorChanged(hwnd.0 as _);
+            if let Err(e) = send_event(event) {
+                tracing::warn!(?e);
+            }
+        }
+    }
+
     return CallNextHookEx(None, code, wparam, lparam);
 }
 
 #[no_mangle]
 pub unsafe extern "system" fn cbt_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code == HCBT_DESTROYWND as _ {
-        // let hwnd = HWND(wparam.0 as _);
-
-        // if is_real_window(hwnd, params) {
-        //     let event = ClientEvent::WindowClose(hwnd.0 as _);
-        //     if let Err(e) = send_event(event) {
-        //         tracing::warn!(?e);
-        //     }
-        // }
-    }
-
     return CallNextHookEx(None, code, wparam, lparam);
 }
 
@@ -138,9 +138,6 @@ unsafe fn send_event(event: ClientEvent) -> Result<ServerCommand, HookError> {
 }
 
 fn is_real_window(handle: HWND) -> bool {
-    // let style = params.style;
-    // let ex_style = params.dwExStyle;
-
     let mut r = RECT::default();
     let _ = unsafe { GetWindowRect(handle, &mut r as *mut _) };
 
@@ -159,18 +156,5 @@ fn is_real_window(handle: HWND) -> bool {
         return false;
     }
 
-    let is_visible = unsafe { IsWindowVisible(handle) }.as_bool();
-    let is_top_level = unsafe { GetAncestor(handle, GA_ROOT) == handle };
-
-    let style = unsafe { GetWindowLongA(handle, GWL_STYLE) };
-    let style_ex = unsafe { GetWindowLongA(handle, GWL_EXSTYLE) };
-
-    let is_child = style & WS_CHILD.0 as i32 != 0;
-    let is_tool_window = style_ex & WS_EX_TOOLWINDOW.0 as i32 != 0;
-
-    // let mut cloaked = 0;
-    // TODO: check for cloaked window
-    tracing::info!(is_visible, is_top_level, is_child, is_tool_window);
-
-    is_visible && is_top_level && !is_child && !is_tool_window
+    return true;
 }

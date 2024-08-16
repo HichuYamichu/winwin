@@ -48,7 +48,9 @@ pub struct EventQueue {
 }
 
 impl EventQueue {
-    pub fn new() -> Self {
+    // SAFETY: Caller must ensure that only one instance is created at a time.
+    // It is safe to create another insance only after calling `shutdown` and waithing for it to finish.
+    pub unsafe fn new() -> (Self, Context) {
         // NOTE: Buffer should be big enough to handle spontaneous bursts of events.
         let (tx, rx) = mpsc::sync_channel(128);
 
@@ -64,39 +66,54 @@ impl EventQueue {
         // This nonsense in necessary because Rust's ThreadId has nothing to do with actual thread id.
         let hook_thread_id = hook_thread_id_rx.recv().unwrap();
 
-        Self {
+        let ctx = Context::new();
+        let s = Self {
             ev_rx: rx,
             key_map: KeyMap::default(),
 
             iocp_handle: *iocp,
             join_handles,
             hook_thread_id,
-        }
+        };
+
+        return (s, ctx)
     }
 
     pub fn next_event<'a>(&mut self, ctx: &'a Context) -> Event<'a> {
-        ctx.arena.reset();
+        // We loop here because we don't want to return to user code on events that we can handle by ourselves.
+        loop {
+            ctx.arena.reset();
 
-        let (event, command_tx) = self.ev_rx.recv().unwrap();
-        match event {
-            ClientEvent::Keyboard(kb_delta) => {
-                self.key_map.update(kb_delta);
-                let input = self.key_map.input(ctx, command_tx);
-                Event::KeyPress(input)
-            }
-            ClientEvent::WindowOpen(handle) => {
-                let window = Window {
-                    handle: HWND(handle as _),
-                };
+            let (event, command_tx) = self.ev_rx.recv().unwrap();
+            match event {
+                ClientEvent::Keyboard(kb_delta) => {
+                    self.key_map.update(kb_delta);
+                    let input = self.key_map.input(ctx, command_tx);
+                    return Event::KeyPress(input);
+                }
+                ClientEvent::WindowOpen(handle) => {
+                    let window = Window {
+                        handle: HWND(handle as _),
+                    };
 
-                Event::WindowOpen(window)
-            }
-            ClientEvent::WindowClose(handle) => {
-                let window = Window {
-                    handle: HWND(handle as _),
-                };
+                    return Event::WindowOpen(window);
+                }
+                ClientEvent::WindowClose(handle) => {
+                    let window = Window {
+                        handle: HWND(handle as _),
+                    };
 
-                Event::WindowClose(window)
+                    return Event::WindowClose(window);
+                }
+                ClientEvent::WindowMonitorChanged(handle) => {
+                    dbg!(&handle);
+                    let window = Window {
+                        handle: HWND(handle as _),
+                    };
+                    let monitor = crate::wm::get_monitor_with_window(ctx, window);
+                    ctx.cache.update_queue(monitor, window);
+                }
+                // ClientEvent::WindowFocusHanged(handle) => {}
             }
         }
     }

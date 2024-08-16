@@ -2,7 +2,7 @@ use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 
-use windows::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
+use windows::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
 
 mod keys;
 pub use keys::*;
@@ -34,6 +34,7 @@ pub enum ClientEvent {
     WindowOpen(usize),
     WindowClose(usize),
     Keyboard(KBDelta),
+    WindowMonitorChanged(usize),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

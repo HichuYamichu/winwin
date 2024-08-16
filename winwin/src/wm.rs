@@ -173,51 +173,6 @@ impl Window {
 #[derive(Debug)]
 pub struct WindowInfo {}
 
-pub fn get_focused_window() -> Window {
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.is_invalid() {
-        return Window::default();
-    }
-    Window { handle: hwnd }
-}
-
-pub fn get_all_windows(ctx: &Context) -> Vec<Window, &Arena> {
-    extern "system" fn push_visible_window(window: HWND, lparam: LPARAM) -> BOOL {
-        unsafe {
-            let len = GetWindowTextLengthW(window);
-
-            let mut info = WINDOWINFO {
-                cbSize: core::mem::size_of::<WINDOWINFO>() as u32,
-                ..Default::default()
-            };
-            let res = GetWindowInfo(window, &mut info);
-            error_if_err!(res);
-
-            if len != 0 && info.dwStyle.contains(WS_VISIBLE) && !info.dwStyle.contains(WS_POPUP) {
-                let dest_vec = lparam.0 as *mut Vec<Window, &Arena>;
-                (*dest_vec).push(Window { handle: window });
-            }
-
-            TRUE
-        }
-    }
-
-    let mut windows = Vec::new_in(&ctx.arena);
-    let res = unsafe {
-        EnumWindows(
-            Some(push_visible_window),
-            LPARAM(&mut windows as *mut _ as isize),
-        )
-    };
-    match res {
-        Ok(_) => windows,
-        Err(e) => {
-            tracing::error!(error = ?e);
-            Vec::new_in(&ctx.arena)
-        }
-    }
-}
-
 pub fn is_minimised(window: Window) -> bool {
     unsafe { IsIconic(window.handle).into() }
 }
@@ -246,24 +201,45 @@ impl Hash for Monitor {
     }
 }
 
-pub fn get_focused_monitor() -> Monitor {
-    let window = get_focused_window();
-    let handle = unsafe { MonitorFromWindow(window.handle, MONITOR_DEFAULTTOPRIMARY) };
-    Monitor { handle }
+pub fn get_focused_window(ctx: &Context) -> Window {
+    ctx.cache.focused_window()
 }
 
-pub fn get_monitor_with_window(window: Window) -> Monitor {
-    let handle = unsafe { MonitorFromWindow(window.handle, MONITOR_DEFAULTTOPRIMARY) };
-    Monitor { handle }
+pub fn get_focused_monitor(ctx: &Context) -> Monitor {
+    ctx.cache.focused_monitor()
+}
+
+pub fn get_monitor_with_window(ctx: &Context, window: Window) -> Monitor {
+    ctx.cache.monitor_with_window(window)
 }
 
 pub fn get_windows_on_monitor(ctx: &Context, monitor: Monitor) -> Vec<Window, &Arena> {
-    let mut windows = get_all_windows(ctx);
-    windows.retain(|w| w.is_on_monitor(monitor));
-    windows
+    ctx.cache.windows_on_monitor(ctx, monitor)
 }
 
 pub fn get_all_monitors(ctx: &Context) -> Vec<Monitor, &Arena> {
+    ctx.cache.monitors(ctx)
+}
+
+pub fn get_all_windows(ctx: &Context) -> Vec<Window, &Arena> {
+    ctx.cache.windows(ctx)
+}
+
+pub(crate) fn get_focused_window_live() -> Window {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return Window::default();
+    }
+    Window { handle: hwnd }
+}
+
+pub(crate) fn get_focused_monitor_live() -> Monitor {
+    let window = get_focused_window_live();
+    let handle = unsafe { MonitorFromWindow(window.handle, MONITOR_DEFAULTTOPRIMARY) };
+    Monitor { handle }
+}
+
+pub(crate) fn get_all_monitors_live(arena: &Arena) -> Vec<Monitor, &Arena> {
     unsafe extern "system" fn push_monitor(
         hmonitor: HMONITOR,
         _lprc_clip: HDC,
@@ -276,7 +252,7 @@ pub fn get_all_monitors(ctx: &Context) -> Vec<Monitor, &Arena> {
         TRUE
     }
 
-    let mut monitors = Vec::new_in(&ctx.arena);
+    let mut monitors = Vec::new_in(arena);
     let success = unsafe {
         EnumDisplayMonitors(
             HDC(std::ptr::null_mut()),
@@ -288,6 +264,43 @@ pub fn get_all_monitors(ctx: &Context) -> Vec<Monitor, &Arena> {
     error_if!(!success);
 
     monitors
+}
+
+pub(crate) fn get_all_windows_live(arena: &Arena) -> Vec<Window, &Arena> {
+    extern "system" fn push_visible_window(window: HWND, lparam: LPARAM) -> BOOL {
+        unsafe {
+            let len = GetWindowTextLengthW(window);
+
+            let mut info = WINDOWINFO {
+                cbSize: core::mem::size_of::<WINDOWINFO>() as u32,
+                ..Default::default()
+            };
+            let res = GetWindowInfo(window, &mut info);
+            error_if_err!(res);
+
+            if len != 0 && info.dwStyle.contains(WS_VISIBLE) && !info.dwStyle.contains(WS_POPUP) {
+                let dest_vec = lparam.0 as *mut Vec<Window, &Arena>;
+                (*dest_vec).push(Window { handle: window });
+            }
+
+            TRUE
+        }
+    }
+
+    let mut windows = Vec::new_in(arena);
+    let res = unsafe {
+        EnumWindows(
+            Some(push_visible_window),
+            LPARAM(&mut windows as *mut _ as isize),
+        )
+    };
+    match res {
+        Ok(_) => windows,
+        Err(e) => {
+            tracing::error!(error = ?e);
+            Vec::new_in(arena)
+        }
+    }
 }
 
 fn adjust_for_non_client_area(
@@ -324,7 +337,7 @@ pub enum Layout {
 }
 
 pub fn apply_layout(ctx: &Context, monitor: Monitor, layout: Layout) {
-    ctx.memory.remember_layout(monitor, layout);
+    ctx.cache.remember_layout(monitor, layout);
     match layout {
         Layout::None => {}
         Layout::Stack => set_stack_layout(ctx, monitor),
@@ -524,6 +537,7 @@ pub fn transform_rects_for_grid(
         scale,
         windows_rect,
         windows_client_rect,
+        // SAFETY: MaybeUninit is repr transparent.
         unsafe { std::mem::transmute(transformed_rects) },
     )
 }
@@ -537,11 +551,9 @@ fn set_full_layout(ctx: &Context, monitor: Monitor) {
 
 pub fn move_focus(ctx: &Context, direction: Direction) {
     let origin_window = get_focused_window();
-    let target_window = get_adjacent(ctx, origin_window, direction);
+    let target_window = get_adjacent_window(ctx, origin_window, direction);
 
-    if let Some(target_window) = target_window {
-        target_window.focus();
-    }
+    target_window.focus();
 }
 
 pub fn swap(w1: Window, w2: Window) {
@@ -553,15 +565,13 @@ pub fn swap(w1: Window, w2: Window) {
 }
 
 pub fn swap_adjacent(ctx: &Context, window: Window, direction: Direction) {
-    let other = get_adjacent(ctx, window, direction);
-
-    if let Some(other) = other {
-        swap(window, other);
-    }
+    let other = get_adjacent_window(ctx, window, direction);
+    swap(window, other);
 }
 
 pub fn send(ctx: &Context, window: Window, monitor: Monitor) {
-    let layout = ctx.memory.layout_on(monitor);
+    let layout = ctx.cache.layout_on(monitor);
+    let origin_monitor = get_monitor_with_window(ctx, window);
     let mut windows = get_windows_on_monitor(ctx, monitor);
     windows.push(window);
 
@@ -586,17 +596,30 @@ pub fn send(ctx: &Context, window: Window, monitor: Monitor) {
                 transformed_rects,
             );
         }
-        Layout::Full => {}
-        Layout::Grid => {}
+        Layout::Full => {
+            todo!()
+        }
+        Layout::Grid => {
+            todo!()
+        }
     }
 
     for (window, rect) in windows.iter().zip(transformed_rects.iter()) {
+        // SAFETY: Slice was initialized by `transform_rects` function.
         window.set_rect(unsafe { rect.assume_init() });
+    }
+
+    // Origin layout is out of date now. Re-apply.
+    {
+        let layout = ctx.cache.layout_on(origin_monitor);
+        apply_layout(ctx, origin_monitor, layout);
     }
 }
 
-pub fn send_in(window: Window, direction: Direction) {
-    todo!()
+pub fn send_in(ctx: &Context, window: Window, direction: Direction) {
+    let monitor = get_monitor_with_window(ctx, window);
+    let target = get_adjacent_monitor(&ctx, monitor, direction);
+    send(ctx, window, target);
 }
 
 pub fn swap_or_send(window: Window, direction: Direction) {
@@ -607,36 +630,74 @@ pub fn swap_monitors(m1: Monitor, m2: Monitor) {
     todo!()
 }
 
-pub fn get_adjacent(ctx: &Context, window: Window, direction: Direction) -> Option<Window> {
-    let windows = get_all_windows(ctx);
+pub fn get_adjacent_window(ctx: &Context, window: Window, direction: Direction) -> Window {
     let origin_rect = window.rect();
-    let origin_center = origin_rect.center();
+    let windows = get_windows_on_monitor(ctx, get_monitor_with_window(ctx, window));
+    let rects: Vec<Rect, &Arena> = windows.iter().map(|w| w.rect()).collect_with(&ctx.arena);
 
-    let mut candidate_windows = Vec::new_in(&ctx.arena);
-
-    let window_centers = windows.iter().map(|w| (w, w.rect().center()));
-    let windows_in_direction = window_centers
-        .filter(|(w, _)| !is_minimised(**w))
-        .filter(|(_, p)| match direction {
-            Direction::Up => p.y <= origin_center.y,
-            Direction::Down => p.y > origin_center.y,
-            Direction::Left => p.x < origin_center.x,
-            Direction::Right => p.x >= origin_center.x,
-        })
-        .filter(|(w, _)| **w != window);
-
-    candidate_windows.extend(windows_in_direction);
-    candidate_windows.sort_by(|(_, a), (_, b)| {
-        let da = a.distance(origin_center);
-        let db = b.distance(origin_center);
-        da.cmp(&db)
-    });
-
-    candidate_windows.first().map(|(w, _)| **w)
+    let target_idx = find_rect(origin_rect, &rects, direction);
+    windows[target_idx]
 }
 
-pub fn get_adjacent_monitor(ctx: &Context, monitor: Monitor, direction: Direction) {
-    todo!()
+pub fn get_adjacent_monitor(ctx: &Context, monitor: Monitor, direction: Direction) -> Monitor {
+    let origin_rect = monitor.rect();
+    let monitors = get_all_monitors(ctx);
+    let rects: Vec<Rect, &Arena> = monitors.iter().map(|m| m.rect()).collect_with(&ctx.arena);
+
+    let target_idx = find_rect(origin_rect, &rects, direction);
+    monitors[target_idx]
+}
+
+// FIXME: 2d navigation is not working correctly.
+pub fn find_rect(origin: Rect, rects: &[Rect], direction: Direction) -> usize {
+    let mut closest_index = 0;
+    let mut closest_distance = i32::MAX;
+
+    for (i, rect) in rects.iter().enumerate() {
+        if rect == &origin {
+            continue;
+        }
+
+        let distance = match direction {
+            Direction::Left => origin.x - (rect.x + rect.width),
+            Direction::Right => rect.x - (origin.x + origin.width),
+            Direction::Up => origin.y - (rect.y + rect.height),
+            Direction::Down => rect.y - (origin.y + origin.height),
+        };
+
+        if distance < 0 {
+            let overlaps = match direction {
+                Direction::Left | Direction::Right => {
+                    rect.y < origin.y + origin.height && rect.y + rect.height > origin.y
+                }
+                Direction::Up | Direction::Down => {
+                    rect.x < origin.x + origin.width && rect.x + rect.width > origin.x
+                }
+            };
+
+            if overlaps {
+                let is_bigger = match direction {
+                    Direction::Left => rect.x < origin.x,
+                    Direction::Right => rect.x + rect.width > origin.x + origin.width,
+                    Direction::Up => rect.y < origin.y,
+                    Direction::Down => rect.y + rect.height > origin.y + origin.height,
+                };
+
+                if is_bigger {
+                    return i;
+                }
+            }
+        } else if distance < closest_distance {
+            closest_distance = distance;
+            closest_index = i;
+        }
+    }
+
+    if closest_distance == i32::MAX {
+        rects.iter().position(|r| r == &origin).unwrap_or(0)
+    } else {
+        closest_index
+    }
 }
 
 pub fn kill_window(window: Window) {
