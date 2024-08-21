@@ -1,3 +1,4 @@
+use allocator_api2::alloc::Allocator;
 use allocator_api2::vec::*;
 use core::slice;
 use std::alloc;
@@ -18,7 +19,7 @@ use winwin_common::{ClientEvent, Rect, ServerCommand, SyncHandle};
 
 use windows::core::{s, PCSTR};
 
-use crate::{Arena, Context, Key, KeyState, Window};
+use crate::{Arena, Cache, Context, Input, Key, KeyState, Window};
 pub use winwin_common::KBDelta;
 
 const THREAD_POOL_SIZE: usize = 2;
@@ -40,8 +41,8 @@ pub enum Event<'a> {
 
 pub struct EventQueue {
     ev_rx: Receiver<(ClientEvent, SyncSender<ServerCommand>)>,
-    key_map: KeyMap,
 
+    // Used for shutdown and cleanup.
     iocp_handle: HANDLE,
     join_handles: [JoinHandle<()>; 2],
     hook_thread_id: u32,
@@ -50,7 +51,7 @@ pub struct EventQueue {
 impl EventQueue {
     // SAFETY: Caller must ensure that only one instance is created at a time.
     // It is safe to create another insance only after calling `shutdown` and waithing for it to finish.
-    pub unsafe fn new() -> (Self, Context) {
+    pub unsafe fn new(ctx: &Context) -> Self {
         // NOTE: Buffer should be big enough to handle spontaneous bursts of events.
         let (tx, rx) = mpsc::sync_channel(128);
 
@@ -66,17 +67,13 @@ impl EventQueue {
         // This nonsense in necessary because Rust's ThreadId has nothing to do with actual thread id.
         let hook_thread_id = hook_thread_id_rx.recv().unwrap();
 
-        let ctx = Context::new();
-        let s = Self {
+        Self {
             ev_rx: rx,
-            key_map: KeyMap::default(),
 
             iocp_handle: *iocp,
             join_handles,
             hook_thread_id,
-        };
-
-        return (s, ctx)
+        }
     }
 
     pub fn next_event<'a>(&mut self, ctx: &'a Context) -> Event<'a> {
@@ -87,8 +84,7 @@ impl EventQueue {
             let (event, command_tx) = self.ev_rx.recv().unwrap();
             match event {
                 ClientEvent::Keyboard(kb_delta) => {
-                    self.key_map.update(kb_delta);
-                    let input = self.key_map.input(ctx, command_tx);
+                    let input = ctx.update_input(kb_delta, command_tx);
                     return Event::KeyPress(input);
                 }
                 ClientEvent::WindowOpen(handle) => {
@@ -106,14 +102,12 @@ impl EventQueue {
                     return Event::WindowClose(window);
                 }
                 ClientEvent::WindowMonitorChanged(handle) => {
-                    dbg!(&handle);
                     let window = Window {
                         handle: HWND(handle as _),
                     };
                     let monitor = crate::wm::get_monitor_with_window(ctx, window);
-                    ctx.cache.update_queue(monitor, window);
-                }
-                // ClientEvent::WindowFocusHanged(handle) => {}
+                    ctx.update_window_queue(monitor, window);
+                } // ClientEvent::WindowFocusHanged(handle) => {}
             }
         }
     }
@@ -511,80 +505,4 @@ fn create_io_completion_port() -> SyncHandle {
         CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, THREAD_POOL_SIZE as _).unwrap()
     };
     SyncHandle(iocp)
-}
-
-#[derive(Default)]
-pub struct KeyMap {
-    keys: [u32; 8],
-}
-
-impl KeyMap {
-    fn update(&mut self, kb_delta: KBDelta) {
-        let idx = (kb_delta.vk_code / 32) as usize;
-        let bit = kb_delta.vk_code % 32;
-        match kb_delta.key_state {
-            KeyState::Up => {
-                self.keys[idx] &= !(1 << bit);
-            }
-            KeyState::Down => {
-                self.keys[idx] |= 1 << bit;
-            }
-        }
-    }
-
-    fn input<'a>(&self, ctx: &'a Context, tx: SyncSender<ServerCommand>) -> Input<'a> {
-        let mut pressed_keys = Vec::new_in(&ctx.arena);
-
-        for i in 0..256 {
-            let idx = i / 32;
-            let bit = i % 32;
-            if self.keys[idx] & (1 << bit) != 0 {
-                pressed_keys.push(Key::from_vk_code(i as u8));
-            }
-        }
-
-        Input {
-            keys: pressed_keys,
-            intercept_tx: tx,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Input<'a> {
-    keys: Vec<Key, &'a Arena>,
-    intercept_tx: SyncSender<ServerCommand>,
-}
-
-impl<'a> Drop for Input<'a> {
-    fn drop(&mut self) {
-        let _ = self.intercept_tx.try_send(ServerCommand::None);
-    }
-}
-
-impl Input<'_> {
-    pub fn pressed(&self, key: Key) -> bool {
-        let pressed = self.pressed_no_intercept(key);
-        if pressed {
-            let _ = self.intercept_tx.try_send(ServerCommand::InterceptKeypress);
-        }
-        pressed
-    }
-
-    pub fn pressed_no_intercept(&self, key: Key) -> bool {
-        self.keys[0] == key
-    }
-
-    pub fn all_pressed(&self, keys: &[Key]) -> bool {
-        let pressed = self.all_pressed_no_intercept(keys);
-        if pressed {
-            let _ = self.intercept_tx.try_send(ServerCommand::InterceptKeypress);
-        }
-        pressed
-    }
-
-    pub fn all_pressed_no_intercept(&self, keys: &[Key]) -> bool {
-        // Make sure len is the same otherwise we might match different keybind.
-        keys.iter().all(|it| self.keys.iter().any(|k| *k == *it)) && self.keys.len() == keys.len()
-    }
 }

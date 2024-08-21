@@ -1,5 +1,6 @@
 use allocator_api2::alloc::AllocError;
 use allocator_api2::alloc::Allocator;
+use allocator_api2::alloc::Global as GlobalAllocator;
 use allocator_api2::vec::Vec;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -7,8 +8,11 @@ use std::cell::UnsafeCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
+use std::sync::mpsc::SyncSender;
 use std::{alloc, ptr::NonNull};
+use winwin_common::ServerCommand;
 
 pub use winwin_common::{Key, KeyState};
 
@@ -37,30 +41,94 @@ macro_rules! error_if {
     };
 }
 
-pub struct Context {
-    // Arena allocator for temporary (on event) allocations.
+pub struct Context<A: Allocator = GlobalAllocator> {
     arena: Arena,
-    pub cache: Cache,
+    alloc: A,
+    cache: UnsafeCell<Cache>,
+
+    // Make `Context` !Send and !Sync.
+    _marker: PhantomData<*mut ()>,
 }
 
-impl Context {
-    pub(crate) fn new() -> Self {
+impl Context<GlobalAllocator> {
+    pub fn new() -> Self {
         let arena = Arena::new_with_global_alloc();
-        let monitors = wm::get_all_monitors_live(&arena);
-
-        let mut map = HashMap::with_capacity(monitors.len());
-        let windows = wm::get_all_windows_live(&arena);
-
-        for monitor in monitors {
-            let windows_on_monitor = windows.iter().filter(|w| w.is_on_monitor(monitor));
-            let vd = VecDeque::from_iter(windows_on_monitor);
-            map.insert(monitor, vd);
-        }
+        let alloc = GlobalAllocator;
+        let cache = Cache::default();
 
         Self {
             arena,
-            cache: Cache::new(map),
+            alloc,
+            cache: UnsafeCell::new(cache),
+
+            _marker: PhantomData,
         }
+    }
+}
+
+impl<A: Allocator> Context<A> {
+    pub fn new_in(a: A) -> Self {
+        let arena = Arena::new_with_global_alloc();
+        let cache = Cache::default();
+
+        Self {
+            arena,
+            alloc: a,
+            cache: UnsafeCell::new(cache),
+
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<A: Allocator> Context<A> {
+    pub(crate) fn update_window_queue(&self, monitor: Monitor, window: Window) {
+        // SAFETY: We do not create nor retain any references to cache data, everything is copied
+        // out of the cache.
+        let cache = unsafe { &mut *self.cache.get() };
+        let queues = &mut cache.window_queues;
+
+        let entry = queues.entry(monitor);
+        match entry {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(e) => {
+                // There was no cache entry for this monitor so we only need to create one.
+                e.insert(VecDeque::from([window]));
+                return;
+            }
+        };
+
+        // There are three cases:
+        // 1. Window was not present in any queue and must be added.
+        // 2. Window was in different queue and must be moved.
+        // 3. Windows was in correct queue but must be moved to the front.
+        // Looping unconditionaly saves us from figuring out which case we were in. Instead we just
+        // add to correct queue once we know that window does not exist elsewhere.
+        for q in queues.values_mut() {
+            q.retain(|w| *w != window);
+        }
+        let queue = queues
+            .get_mut(&monitor)
+            .expect("if we got here queue must exist");
+        queue.push_front(window);
+    }
+
+    pub(crate) fn update_input(
+        &self,
+        kb_delta: KBDelta,
+        command_tx: SyncSender<ServerCommand>,
+    ) -> Input<'_> {
+        // SAFETY: Context can't be used by miltiple threads so we only need to worry
+        // about outstanding references which do not exist because we do not give out
+        // any nor retain any.
+        let cache = unsafe { &mut *self.cache.get() };
+        cache.key_map.update(kb_delta);
+        let input = cache.key_map.input(self, command_tx);
+        input
+    }
+
+    pub(crate) fn fill_cache() {
+        todo!()
     }
 }
 
@@ -181,112 +249,87 @@ impl<I: Iterator> IteratorCollectWithAlloc for I {}
 
 #[derive(Default)]
 pub struct Cache {
-    monitor_layouts: RefCell<HashMap<Monitor, Layout>>,
-    window_queues: UnsafeCell<HashMap<Monitor, VecDeque<Window>>>,
+    key_map: KeyMap,
+    monitor_layouts: HashMap<Monitor, Layout>,
+    window_queues: HashMap<Monitor, VecDeque<Window>>,
 }
 
-impl Cache {
-    pub fn new(precache: HashMap<Monitor, VecDeque<Window>>) -> Self {
-        Self {
-            monitor_layouts: RefCell::default(),
-            window_queues: UnsafeCell::new(precache),
-        }
-    }
+#[derive(Default)]
+pub struct KeyMap {
+    keys: [u32; 8],
+}
 
-    pub fn remember_layout(&self, monitor: Monitor, layout: Layout) {
-        let mut monitor_layouts = self.monitor_layouts.borrow_mut();
-        monitor_layouts.insert(monitor, layout);
-    }
-
-    pub fn layout_on(&self, monitor: Monitor) -> Layout {
-        let monitor_layouts = self.monitor_layouts.borrow();
-        *monitor_layouts.get(&monitor).unwrap_or(&Layout::None)
-    }
-
-    pub(crate) fn update_queue(&self, monitor: Monitor, window: Window) {
-        // SAFETY: There are no outstanding references to inner data because we do not hand out any
-        // and do not retain any.
-        let queues = unsafe { &mut *self.window_queues.get() };
-
-        let entry = queues.entry(monitor);
-        match entry {
-            Entry::Occupied(_) => {}
-            Entry::Vacant(e) => {
-                // There was no cache entry for this monitor so we only need to create one.
-                e.insert(VecDeque::from([window]));
-                return;
+impl KeyMap {
+    pub fn update(&mut self, kb_delta: KBDelta) {
+        let idx = (kb_delta.vk_code / 32) as usize;
+        let bit = kb_delta.vk_code % 32;
+        match kb_delta.key_state {
+            KeyState::Up => {
+                self.keys[idx] &= !(1 << bit);
             }
-        };
-
-        // There are three cases:
-        // 1. Window was not present in any queue and must be added.
-        // 2. Window was in different queue and must be moved.
-        // 3. Windows was in correct queue but must be moved to the front.
-        // Looping unconditionaly saves us from figuring out which case we were in. Instead we just
-        // add to correct queue once we know that window does not exist elsewhere.
-        for q in queues.values_mut() {
-            q.retain(|w| *w != window);
-        }
-        let queue = queues
-            .get_mut(&monitor)
-            .expect("if we got here queue must exist");
-        queue.push_front(window);
-        dbg!(&queues);
-    }
-
-    pub(crate) fn monitor_with_window(&self, window: Window) -> Monitor {
-        // SAFETY: There are no outstanding references to inner data because we do not hand out any
-        // and do not retain any.
-        let queues = unsafe { &*self.window_queues.get() };
-        for (k, q) in queues.iter() {
-            if q.contains(&window) {
-                return *k;
+            KeyState::Down => {
+                self.keys[idx] |= 1 << bit;
             }
         }
-
-        Monitor::default()
     }
 
-    pub(crate) fn windows_on_monitor<'a>(
+    pub fn input<'a, A: Allocator>(
         &self,
-        ctx: &'a Context,
-        monitor: Monitor,
-    ) -> Vec<Window, &'a Arena> {
-        // SAFETY: There are no outstanding references to inner data because we do not hand out any
-        // and do not retain any.
-        let queues = unsafe { &*self.window_queues.get() };
-        queues
-            .get(&monitor)
-            .unwrap_or(&VecDeque::new())
-            .iter()
-            .copied()
-            .collect_with(&ctx.arena)
+        ctx: &'a Context<A>,
+        tx: SyncSender<ServerCommand>,
+    ) -> Input<'a> {
+        let mut pressed_keys = Vec::new_in(&ctx.arena);
+
+        for i in 0..256 {
+            let idx = i / 32;
+            let bit = i % 32;
+            if self.keys[idx] & (1 << bit) != 0 {
+                pressed_keys.push(Key::from_vk_code(i as u8));
+            }
+        }
+
+        Input {
+            keys: pressed_keys,
+            intercept_tx: tx,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Input<'a> {
+    keys: Vec<Key, &'a Arena>,
+    intercept_tx: SyncSender<ServerCommand>,
+}
+
+impl<'a> Drop for Input<'a> {
+    fn drop(&mut self) {
+        let _ = self.intercept_tx.try_send(ServerCommand::None);
+    }
+}
+
+impl Input<'_> {
+    pub fn pressed(&self, key: Key) -> bool {
+        let pressed = self.pressed_no_intercept(key);
+        if pressed {
+            let _ = self.intercept_tx.try_send(ServerCommand::InterceptKeypress);
+        }
+        pressed
     }
 
-    pub(crate) fn monitors<'a>(&self, ctx: &'a Context) -> Vec<Monitor, &'a Arena> {
-        // SAFETY: There are no outstanding references to inner data because we do not hand out any
-        // and do not retain any.
-        let queues = unsafe { &*self.window_queues.get() };
-        queues.keys().copied().collect_with(&ctx.arena)
+    pub fn pressed_no_intercept(&self, key: Key) -> bool {
+        self.keys[0] == key
     }
 
-    pub(crate) fn windows<'a>(&self, ctx: &'a Context) -> Vec<Window, &'a Arena> {
-        // SAFETY: There are no outstanding references to inner data because we do not hand out any
-        // and do not retain any.
-        let queues = unsafe { &*self.window_queues.get() };
-        queues
-            .values()
-            .map(|q| q.iter())
-            .flatten()
-            .copied()
-            .collect_with(&ctx.arena)
+    pub fn all_pressed(&self, keys: &[Key]) -> bool {
+        let pressed = self.all_pressed_no_intercept(keys);
+        if pressed {
+            let _ = self.intercept_tx.try_send(ServerCommand::InterceptKeypress);
+        }
+        pressed
     }
 
-    pub(crate) fn focused_monitor(&self) -> Monitor {
-        todo!()
-    }
-
-    pub(crate) fn focused_window(&self) -> Window {
-        todo!()
+    pub fn all_pressed_no_intercept(&self, keys: &[Key]) -> bool {
+        // Make sure len is the same otherwise we might match different keybind.
+        keys.iter().all(|it| self.keys.iter().any(|k| *k == *it)) && self.keys.len() == keys.len()
     }
 }

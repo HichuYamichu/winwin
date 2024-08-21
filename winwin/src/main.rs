@@ -15,11 +15,12 @@ fn main() {
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let mod_key = Key::AltLeft;
+    let ctx = Context::new();
+
     // SAFETY: There can be only one `EventQueue` at a time and it must be pulled for events or shutdown.
     // This is the only place and time where `EventQueue` is constructed and we pool right after so
     // this is safe and correct.
-    let (mut queue, ctx) = unsafe { EventQueue::new() };
-
+    let mut queue = unsafe { EventQueue::new(&ctx) };
     loop {
         let event = queue.next_event(&ctx);
         match event {
@@ -48,51 +49,55 @@ fn main() {
 
                 // Swap adjacent windows.
                 if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::L]) {
-                    swap_adjacent(&ctx, get_focused_window(), Direction::Right);
+                    let window = get_focused_window(&ctx);
+                    swap_adjacent(&ctx, window, Direction::Right);
                 }
 
                 if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::H]) {
-                    swap_adjacent(&ctx, get_focused_window(), Direction::Left);
+                    let window = get_focused_window(&ctx);
+                    swap_adjacent(&ctx, window, Direction::Left);
                 }
 
                 if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::J]) {
-                    swap_adjacent(&ctx, get_focused_window(), Direction::Down);
+                    let window = get_focused_window(&ctx);
+                    swap_adjacent(&ctx, window, Direction::Down);
                 }
 
                 if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::K]) {
-                    swap_adjacent(&ctx, get_focused_window(), Direction::Up);
+                    let window = get_focused_window(&ctx);
+                    swap_adjacent(&ctx, window, Direction::Up);
                 }
 
                 // Apply selected layout.
                 if input.all_pressed(&[mod_key, Key::Q]) {
-                    let monitor = get_focused_monitor();
+                    let monitor = get_focused_monitor(&ctx);
                     apply_layout(&ctx, monitor, Layout::Stack);
                 }
 
                 if input.all_pressed(&[mod_key, Key::W]) {
-                    let monitor = get_focused_monitor();
+                    let monitor = get_focused_monitor(&ctx);
                     apply_layout(&ctx, monitor, Layout::Full);
                 }
 
                 if input.all_pressed(&[mod_key, Key::E]) {
-                    let monitor = get_focused_monitor();
+                    let monitor = get_focused_monitor(&ctx);
                     apply_layout(&ctx, monitor, Layout::Grid);
                 }
 
                 if input.all_pressed(&[mod_key, Key::R]) {
-                    let monitor = get_focused_monitor();
+                    let monitor = get_focused_monitor(&ctx);
                     apply_layout(&ctx, monitor, Layout::None);
                 }
 
                 // Moving windows across monitors.
                 if input.all_pressed(&[mod_key, Key::Right]) {
-                    let window = get_focused_window();
+                    let window = get_focused_window(&ctx);
                     send_in(&ctx, window, Direction::Right);
                 }
 
                 // Window closing.
                 if input.all_pressed(&[mod_key, Key::BackSlash]) {
-                    let window = get_focused_window();
+                    let window = get_focused_window(&ctx);
                     kill_window(window);
                 }
 
@@ -102,15 +107,14 @@ fn main() {
             }
             Event::WindowOpen(window) => {
                 let monitor = get_monitor_with_window(&ctx, window);
-                let layout = ctx.cache.layout_on(monitor);
+                let layout = layout_on(&ctx, monitor);
                 apply_layout(&ctx, monitor, layout);
             }
             Event::WindowClose(window) => {
                 let monitor = get_monitor_with_window(&ctx, window);
-                let layout = ctx.cache.layout_on(monitor);
+                let layout = layout_on(&ctx, monitor);
                 apply_layout(&ctx, monitor, layout);
-            }
-            // TODO: Handle monitor connection/disconection.
+            } // TODO: Handle monitor connection/disconection.
         }
     }
 }

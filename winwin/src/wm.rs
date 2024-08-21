@@ -1,4 +1,6 @@
+use allocator_api2::alloc::Allocator;
 use allocator_api2::vec::*;
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::mem::MaybeUninit;
 use windows::Win32::UI::HiDpi::*;
@@ -201,72 +203,159 @@ impl Hash for Monitor {
     }
 }
 
-pub fn get_focused_window(ctx: &Context) -> Window {
-    ctx.cache.focused_window()
-}
+fn adjust_for_non_client_area(
+    target_rect: Rect,
+    window_rect: Rect,
+    client_rect: Rect,
+    scale: f64,
+) -> Rect {
+    let border_width = ((window_rect.width - client_rect.width) / 2) as i32;
+    let title_height = (window_rect.height - client_rect.height - border_width) as i32;
 
-pub fn get_focused_monitor(ctx: &Context) -> Monitor {
-    ctx.cache.focused_monitor()
-}
-
-pub fn get_monitor_with_window(ctx: &Context, window: Window) -> Monitor {
-    ctx.cache.monitor_with_window(window)
-}
-
-pub fn get_windows_on_monitor(ctx: &Context, monitor: Monitor) -> Vec<Window, &Arena> {
-    ctx.cache.windows_on_monitor(ctx, monitor)
-}
-
-pub fn get_all_monitors(ctx: &Context) -> Vec<Monitor, &Arena> {
-    ctx.cache.monitors(ctx)
-}
-
-pub fn get_all_windows(ctx: &Context) -> Vec<Window, &Arena> {
-    ctx.cache.windows(ctx)
-}
-
-pub(crate) fn get_focused_window_live() -> Window {
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.is_invalid() {
-        return Window::default();
+    Rect {
+        x: (target_rect.x as f64 / scale).round() as i32 - border_width,
+        y: (target_rect.y as f64 / scale).round() as i32 - title_height,
+        width: (target_rect.width as f64 / scale).round() as i32 + border_width * 2,
+        height: (target_rect.height as f64 / scale).round() as i32 + title_height + border_width,
     }
-    Window { handle: hwnd }
 }
 
-pub(crate) fn get_focused_monitor_live() -> Monitor {
-    let window = get_focused_window_live();
-    let handle = unsafe { MonitorFromWindow(window.handle, MONITOR_DEFAULTTOPRIMARY) };
-    Monitor { handle }
+fn get_dpi_for_monitor(monitor: Monitor) -> (u32, u32) {
+    let mut dpi_x = 0;
+    let mut dpi_y = 0;
+    let _ = unsafe { GetDpiForMonitor(monitor.handle, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+    (dpi_x, dpi_y)
 }
 
-pub(crate) fn get_all_monitors_live(arena: &Arena) -> Vec<Monitor, &Arena> {
-    unsafe extern "system" fn push_monitor(
-        hmonitor: HMONITOR,
-        _lprc_clip: HDC,
-        _lpfn_enum: *mut RECT,
-        lparam: LPARAM,
-    ) -> BOOL {
-        let dest_vec = lparam.0 as *mut Vec<Monitor, &Arena>;
-        (*dest_vec).push(Monitor { handle: hmonitor });
+#[derive(Default, Clone, Copy)]
+pub enum Layout {
+    #[default]
+    None,
+    Stack,
+    Grid,
+    Full,
+}
 
-        TRUE
+pub fn apply_layout<A>(ctx: &Context<A>, monitor: Monitor, layout: Layout)
+where
+    A: Allocator + Copy,
+{
+    save_layout(ctx, monitor, layout);
+    match layout {
+        Layout::None => {}
+        Layout::Stack => set_stack_layout(ctx, monitor),
+        Layout::Grid => set_grid_layout(ctx, monitor),
+        Layout::Full => set_full_layout(ctx, monitor),
+    }
+}
+
+pub fn save_layout<A>(ctx: &Context<A>, monitor: Monitor, layout: Layout)
+where
+    A: Allocator + Copy,
+{
+    // SAFETY: Context can't be used by miltiple threads so we only need to worry
+    // about outstanding references which do not exist because we do not give out any nor retain
+    // any.
+    let cache = unsafe { &mut *ctx.cache.get() };
+    cache.monitor_layouts.insert(monitor, layout);
+}
+
+pub fn layout_on<A>(ctx: &Context<A>, monitor: Monitor) -> Layout
+where
+    A: Allocator + Copy,
+{
+    // SAFETY: See `save_layout` safety comment.
+    let cache = unsafe { &mut *ctx.cache.get() };
+
+    *cache.monitor_layouts.get(&monitor).unwrap_or(&Layout::None)
+}
+
+pub fn get_monitor_with_window<A>(ctx: &Context<A>, window: Window) -> Monitor
+where
+    A: Allocator + Copy,
+{
+    // SAFETY: See `save_layout` safety comment.
+    let cache = unsafe { &mut *ctx.cache.get() };
+    let queues = &cache.window_queues;
+
+    for (k, q) in queues.iter() {
+        if q.contains(&window) {
+            return *k;
+        }
     }
 
-    let mut monitors = Vec::new_in(arena);
-    let success = unsafe {
-        EnumDisplayMonitors(
-            HDC(std::ptr::null_mut()),
-            None,
-            Some(push_monitor),
-            LPARAM(&mut monitors as *mut _ as isize),
-        )
-    };
-    error_if!(!success);
-
-    monitors
+    Monitor::default()
 }
 
-pub(crate) fn get_all_windows_live(arena: &Arena) -> Vec<Window, &Arena> {
+pub fn get_windows_on_monitor<A>(ctx: &Context<A>, monitor: Monitor) -> Vec<Window>
+where
+    A: Allocator + Copy,
+{
+    // SAFETY: See `save_layout` safety comment.
+    let cache = unsafe { &mut *ctx.cache.get() };
+    let queues = &cache.window_queues;
+    queues
+        .get(&monitor)
+        .unwrap_or(&VecDeque::new())
+        .iter()
+        .copied()
+        .collect()
+}
+
+pub fn get_monitors<A>(ctx: &Context<A>) -> Vec<Monitor>
+where
+    A: Allocator + Copy,
+{
+    // SAFETY: See `save_layout` safety comment.
+    let cache = unsafe { &mut *ctx.cache.get() };
+    let queues = &cache.window_queues;
+    queues.keys().copied().collect()
+}
+
+pub(crate) fn get_monitors_live<A: Allocator>(ctx: &Context<A>) -> Vec<Monitor, A> {
+    todo!()
+    // unsafe extern "system" fn push_monitor(
+    //     hmonitor: HMONITOR,
+    //     _lprc_clip: HDC,
+    //     _lpfn_enum: *mut RECT,
+    //     lparam: LPARAM,
+    // ) -> BOOL {
+    //     let dest_vec = lparam.0 as *mut Vec<Monitor, &Arena>;
+    //     (*dest_vec).push(Monitor { handle: hmonitor });
+    //
+    //     TRUE
+    // }
+    //
+    // let mut monitors  = Vec::new_in(&ctx.alloc);
+    // let success = unsafe {
+    //     EnumDisplayMonitors(
+    //         HDC(std::ptr::null_mut()),
+    //         None,
+    //         Some(push_monitor),
+    //         LPARAM(&mut monitors as *mut _ as isize),
+    //     )
+    // };
+    // error_if!(!success);
+    //
+    // monitors
+}
+
+pub fn get_windows<A>(ctx: &Context<A>) -> Vec<Window>
+where
+    A: Allocator + Copy,
+{
+    // SAFETY: See `save_layout` safety comment.
+    let cache = unsafe { &mut *ctx.cache.get() };
+    let queues = &cache.window_queues;
+    queues
+        .values()
+        .map(|q| q.iter())
+        .flatten()
+        .copied()
+        .collect()
+}
+
+pub(crate) fn get_windows_live(arena: &Arena) -> Vec<Window, &Arena> {
     extern "system" fn push_visible_window(window: HWND, lparam: LPARAM) -> BOOL {
         unsafe {
             let len = GetWindowTextLengthW(window);
@@ -303,50 +392,38 @@ pub(crate) fn get_all_windows_live(arena: &Arena) -> Vec<Window, &Arena> {
     }
 }
 
-fn adjust_for_non_client_area(
-    target_rect: Rect,
-    window_rect: Rect,
-    client_rect: Rect,
-    scale: f64,
-) -> Rect {
-    let border_width = ((window_rect.width - client_rect.width) / 2) as i32;
-    let title_height = (window_rect.height - client_rect.height - border_width) as i32;
+pub fn get_focused_monitor<A>(ctx: &Context<A>) -> Monitor
+where
+    A: Allocator + Copy,
+{
+    todo!()
+}
 
-    Rect {
-        x: (target_rect.x as f64 / scale).round() as i32 - border_width,
-        y: (target_rect.y as f64 / scale).round() as i32 - title_height,
-        width: (target_rect.width as f64 / scale).round() as i32 + border_width * 2,
-        height: (target_rect.height as f64 / scale).round() as i32 + title_height + border_width,
+pub(crate) fn get_focused_monitor_live() -> Monitor {
+    let window = get_focused_window_live();
+    let handle = unsafe { MonitorFromWindow(window.handle, MONITOR_DEFAULTTOPRIMARY) };
+    Monitor { handle }
+}
+
+pub fn get_focused_window<A>(ctx: &Context<A>) -> Window
+where
+    A: Allocator + Copy,
+{
+    todo!()
+}
+
+pub(crate) fn get_focused_window_live() -> Window {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return Window::default();
     }
+    Window { handle: hwnd }
 }
 
-fn get_dpi_for_monitor(monitor: Monitor) -> (u32, u32) {
-    let mut dpi_x = 0;
-    let mut dpi_y = 0;
-    let _ = unsafe { GetDpiForMonitor(monitor.handle, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
-    (dpi_x, dpi_y)
-}
-
-#[derive(Default, Clone, Copy)]
-pub enum Layout {
-    #[default]
-    None,
-    Stack,
-    Grid,
-    Full,
-}
-
-pub fn apply_layout(ctx: &Context, monitor: Monitor, layout: Layout) {
-    ctx.cache.remember_layout(monitor, layout);
-    match layout {
-        Layout::None => {}
-        Layout::Stack => set_stack_layout(ctx, monitor),
-        Layout::Grid => set_grid_layout(ctx, monitor),
-        Layout::Full => set_full_layout(ctx, monitor),
-    }
-}
-
-fn set_stack_layout(ctx: &Context, monitor: Monitor) {
+fn set_stack_layout<A>(ctx: &Context<A>, monitor: Monitor)
+where
+    A: Allocator + Copy,
+{
     let windows = get_windows_on_monitor(ctx, monitor);
 
     match windows.len() {
@@ -372,10 +449,9 @@ fn set_stack_layout(ctx: &Context, monitor: Monitor) {
                 &windows_client_rect,
                 transformed_rects,
             );
-            // let t: &mut [Rect] = unsafe { std::mem::transmute(transformed_rects) };
-            // dbg!(&t);
 
             for (window, rect) in windows.iter().zip(transformed_rects.iter()) {
+                // SAFETY: Slice was initialized by `transform_rects` function.
                 window.set_rect(unsafe { rect.assume_init() });
             }
         }
@@ -436,11 +512,15 @@ pub fn transform_rects_for_stack(
         scale,
         windows_rect,
         windows_client_rect,
+        // SAFETY: MaybeUninit is repr transparent T.
         unsafe { std::mem::transmute(transformed_rects) },
     )
 }
 
-fn set_grid_layout(ctx: &Context, monitor: Monitor) {
+fn set_grid_layout<A>(ctx: &Context<A>, monitor: Monitor)
+where
+    A: Allocator + Copy,
+{
     let windows = get_windows_on_monitor(ctx, monitor);
 
     match windows.len() {
@@ -468,6 +548,7 @@ fn set_grid_layout(ctx: &Context, monitor: Monitor) {
             );
 
             for (window, rect) in windows.iter().zip(transformed_rects.iter()) {
+                // SAFETY: Slice was initialized by `transform_rects` function.
                 window.set_rect(unsafe { rect.assume_init() });
             }
         }
@@ -542,15 +623,21 @@ pub fn transform_rects_for_grid(
     )
 }
 
-fn set_full_layout(ctx: &Context, monitor: Monitor) {
+pub fn set_full_layout<A>(ctx: &Context<A>, monitor: Monitor)
+where
+    A: Allocator + Copy,
+{
     let windows = get_windows_on_monitor(ctx, monitor);
     for window in windows {
         window.maximize();
     }
 }
 
-pub fn move_focus(ctx: &Context, direction: Direction) {
-    let origin_window = get_focused_window();
+pub fn move_focus<A>(ctx: &Context<A>, direction: Direction)
+where
+    A: Allocator + Copy,
+{
+    let origin_window = get_focused_window(ctx);
     let target_window = get_adjacent_window(ctx, origin_window, direction);
 
     target_window.focus();
@@ -564,13 +651,19 @@ pub fn swap(w1: Window, w2: Window) {
     w2.set_rect(w1_rect);
 }
 
-pub fn swap_adjacent(ctx: &Context, window: Window, direction: Direction) {
+pub fn swap_adjacent<A>(ctx: &Context<A>, window: Window, direction: Direction)
+where
+    A: Allocator + Copy,
+{
     let other = get_adjacent_window(ctx, window, direction);
     swap(window, other);
 }
 
-pub fn send(ctx: &Context, window: Window, monitor: Monitor) {
-    let layout = ctx.cache.layout_on(monitor);
+pub fn send<A>(ctx: &Context<A>, window: Window, monitor: Monitor)
+where
+    A: Allocator + Copy,
+{
+    let layout = layout_on(ctx, monitor);
     let origin_monitor = get_monitor_with_window(ctx, window);
     let mut windows = get_windows_on_monitor(ctx, monitor);
     windows.push(window);
@@ -609,14 +702,21 @@ pub fn send(ctx: &Context, window: Window, monitor: Monitor) {
         window.set_rect(unsafe { rect.assume_init() });
     }
 
+    // Borrow checker couldn't figure this out.
+    drop(windows_rect);
+    drop(windows_client_rect);
+
     // Origin layout is out of date now. Re-apply.
     {
-        let layout = ctx.cache.layout_on(origin_monitor);
+        let layout = layout_on(ctx, origin_monitor);
         apply_layout(ctx, origin_monitor, layout);
     }
 }
 
-pub fn send_in(ctx: &Context, window: Window, direction: Direction) {
+pub fn send_in<A>(ctx: &Context<A>, window: Window, direction: Direction)
+where
+    A: Allocator + Copy,
+{
     let monitor = get_monitor_with_window(ctx, window);
     let target = get_adjacent_monitor(&ctx, monitor, direction);
     send(ctx, window, target);
@@ -630,18 +730,25 @@ pub fn swap_monitors(m1: Monitor, m2: Monitor) {
     todo!()
 }
 
-pub fn get_adjacent_window(ctx: &Context, window: Window, direction: Direction) -> Window {
+pub fn get_adjacent_window<A>(ctx: &Context<A>, window: Window, direction: Direction) -> Window
+where
+    A: Allocator + Copy,
+{
     let origin_rect = window.rect();
-    let windows = get_windows_on_monitor(ctx, get_monitor_with_window(ctx, window));
+    let monitor = get_monitor_with_window(ctx, window);
+    let windows = get_windows_on_monitor(ctx, monitor);
     let rects: Vec<Rect, &Arena> = windows.iter().map(|w| w.rect()).collect_with(&ctx.arena);
 
     let target_idx = find_rect(origin_rect, &rects, direction);
     windows[target_idx]
 }
 
-pub fn get_adjacent_monitor(ctx: &Context, monitor: Monitor, direction: Direction) -> Monitor {
+pub fn get_adjacent_monitor<A>(ctx: &Context<A>, monitor: Monitor, direction: Direction) -> Monitor
+where
+    A: Allocator + Copy,
+{
     let origin_rect = monitor.rect();
-    let monitors = get_all_monitors(ctx);
+    let monitors = get_monitors(ctx);
     let rects: Vec<Rect, &Arena> = monitors.iter().map(|m| m.rect()).collect_with(&ctx.arena);
 
     let target_idx = find_rect(origin_rect, &rects, direction);
@@ -709,9 +816,11 @@ pub fn kill_window(window: Window) {
     error_if_err!(res);
 }
 
-pub fn kill_all_windows(ctx: &Context) {
-    let windows = get_all_windows(ctx);
-
+pub fn kill_all_windows<A>(ctx: &Context<A>)
+where
+    A: Allocator + Copy,
+{
+    let windows = get_windows(ctx);
     for window in windows {
         let res = unsafe { PostMessageA(window.handle, WM_CLOSE, WPARAM(0), LPARAM(0)) };
         error_if_err!(res);
