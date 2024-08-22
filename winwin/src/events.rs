@@ -19,7 +19,7 @@ use winwin_common::{ClientEvent, Rect, ServerCommand, SyncHandle};
 
 use windows::core::{s, PCSTR};
 
-use crate::{Arena, Cache, Context, Input, Key, KeyState, Window};
+use crate::{wm, Arena, Cache, Context, Input, Key, KeyState, Monitor, Window};
 pub use winwin_common::KBDelta;
 
 const THREAD_POOL_SIZE: usize = 2;
@@ -35,8 +35,8 @@ extern "system" {
 
 pub enum Event<'a> {
     KeyPress(Input<'a>),
-    WindowOpen(Window),
-    WindowClose(Window),
+    WindowOpen(Window, Monitor),
+    WindowClose(Window, Monitor),
 }
 
 pub struct EventQueue {
@@ -87,27 +87,32 @@ impl EventQueue {
                     let input = ctx.update_input(kb_delta, command_tx);
                     return Event::KeyPress(input);
                 }
-                ClientEvent::WindowOpen(handle) => {
-                    let window = Window {
-                        handle: HWND(handle as _),
-                    };
+                ClientEvent::WindowOpen(window_handle, monitor_handle) => {
+                    let window = Window::from(window_handle);
+                    let monitor = Monitor::from(monitor_handle);
+                    ctx.add_window_to_queue(window, monitor);
 
-                    return Event::WindowOpen(window);
+                    return Event::WindowOpen(window, monitor);
                 }
-                ClientEvent::WindowClose(handle) => {
-                    let window = Window {
-                        handle: HWND(handle as _),
-                    };
+                ClientEvent::WindowClose(window_handle, monitor_handle) => {
+                    let window = Window::from(window_handle);
+                    let monitor = Monitor::from(monitor_handle);
+                    ctx.remove_window_from_queue(window, monitor);
 
-                    return Event::WindowClose(window);
+                    return Event::WindowClose(window, monitor);
                 }
-                ClientEvent::WindowMonitorChanged(handle) => {
-                    let window = Window {
-                        handle: HWND(handle as _),
-                    };
-                    let monitor = crate::wm::get_monitor_with_window(ctx, window);
+                ClientEvent::WindowMonitorChanged(window_handle, monitor_handle) => {
+                    let window = Window::from(window_handle);
+                    let monitor = Monitor::from(monitor_handle);
+                    ctx.move_window_to_queue(window, monitor);
+                }
+                ClientEvent::WindowFocusHanged(handle) => {
+                    let window = Window::from(handle);
+                    let monitor = wm::get_monitor_with_window(ctx, window);
                     ctx.update_window_queue(monitor, window);
-                } // ClientEvent::WindowFocusHanged(handle) => {}
+                }
+                ClientEvent::MonitorConnected(handle) => {}
+                ClientEvent::MonitorDisconnected(handle) => {}
             }
         }
     }

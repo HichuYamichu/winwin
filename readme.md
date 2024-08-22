@@ -1,6 +1,6 @@
 # winwin
 
-winwin is a window manager for Windows inspired by my experience using xMonad. Currently this project is in its alpha state, hovewer it's stable enough to play around with it for a bit.
+winwin is a window manager for Windows inspired by my experience using xMonad. Currently this project is in its alpha state.
 
 # Installation and configuration
 
@@ -10,13 +10,18 @@ See main.rs file for configuration example showcasing most currently available f
 
 # Rough edges
 
-- Most window manipulation functions are not good enough; there are small but noticable gaps between windows after applying the given layout.
-- Window ordering can change unpredictably when window is open or closed.
-- There is no virtual desktop support yet (the goal is to use windows native virtual desktops instead of implementing a custom solution)..
+- There is no virtual desktop support yet (the goal is to use windows native virtual desktops instead of implementing a custom solution).
 - There is a huge amount of window positioning functionality that has not yet been implemented.
 - Once EventQueue is created, it MUST be pulled for events; not doing so will cause internal quque to fill up, which in turn can cause most desktop applications to stop responding.
 
+All of the above issues are going to be resolved soon.
 
-# Performance
+# Design considerations
 
-winwin in made with performance in mind. Its event-based architecture and careful memory management guarantee a low CPU and memory footprint.
+- winwin does not use any major 3rd party libraries; everything is handmade.
+- winwin uses allocator api wherever possible. Most importantly, it uses an arena allocator for event-scoped allocations.
+- winwin uses a custom IPC and event loop solution, ensuring optimal thread utilization. There are no spin loops; IO is done with IOCP in order to avoid wasted CPU cycles.
+- winwin's api is mostly procedural with a functional feel. This makes it easy for rust newbies to use and configure.
+- winwin functions do not return errors. The only failure points in this library are Windows calls. Their errors are not actionable for the end user in almost all cases. Instead of propagating errors up, winwin attempts to perform requested actions and logs any failure cases. winwin keeps a minimal internal state and all changes to it always succeed and are always valid; failing actions do not leave the application in an invalid state.
+
+

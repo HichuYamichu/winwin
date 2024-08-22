@@ -1,5 +1,6 @@
 use windows::core::{s, PCSTR};
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Pipes::*;
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
@@ -63,7 +64,8 @@ pub unsafe extern "system" fn shell_proc(code: i32, wparam: WPARAM, lparam: LPAR
         let hwnd = HWND(wparam.0 as _);
 
         if is_real_window(hwnd) {
-            let event = ClientEvent::WindowOpen(hwnd.0 as _);
+            let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let event = ClientEvent::WindowOpen(hwnd.0 as _, hmonitor.0 as _);
             if let Err(e) = send_event(event) {
                 tracing::warn!(?e);
             }
@@ -72,8 +74,9 @@ pub unsafe extern "system" fn shell_proc(code: i32, wparam: WPARAM, lparam: LPAR
 
     if code == HSHELL_WINDOWDESTROYED as _ {
         let hwnd = HWND(wparam.0 as _);
+        let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
 
-        let event = ClientEvent::WindowClose(hwnd.0 as _);
+        let event = ClientEvent::WindowClose(hwnd.0 as _, hmonitor.0 as _);
         if let Err(e) = send_event(event) {
             tracing::warn!(?e);
         }
@@ -81,9 +84,10 @@ pub unsafe extern "system" fn shell_proc(code: i32, wparam: WPARAM, lparam: LPAR
 
     if code == HSHELL_MONITORCHANGED as _ {
         let hwnd = HWND(wparam.0 as _);
+        let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
 
         if is_real_window(hwnd) {
-            let event = ClientEvent::WindowMonitorChanged(hwnd.0 as _);
+            let event = ClientEvent::WindowMonitorChanged(hwnd.0 as _, hmonitor.0 as _);
             if let Err(e) = send_event(event) {
                 tracing::warn!(?e);
             }

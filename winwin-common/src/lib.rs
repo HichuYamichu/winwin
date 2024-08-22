@@ -31,10 +31,13 @@ pub enum ServerCommand {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientEvent {
-    WindowOpen(usize),
-    WindowClose(usize),
+    WindowOpen(usize, usize),
+    WindowClose(usize, usize),
     Keyboard(KBDelta),
-    WindowMonitorChanged(usize),
+    WindowMonitorChanged(usize, usize),
+    WindowFocusHanged(usize),
+    MonitorConnected(usize),
+    MonitorDisconnected(usize),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -81,7 +81,7 @@ impl<A: Allocator> Context<A> {
     }
 }
 
-impl<A: Allocator> Context<A> {
+impl<A: Allocator + Copy> Context<A> {
     pub(crate) fn update_window_queue(&self, monitor: Monitor, window: Window) {
         // SAFETY: We do not create nor retain any references to cache data, everything is copied
         // out of the cache.
@@ -111,6 +111,25 @@ impl<A: Allocator> Context<A> {
             .get_mut(&monitor)
             .expect("if we got here queue must exist");
         queue.push_front(window);
+
+        // In order to move window to other monitor it must have been focused.
+        cache.last_focused_monitor = monitor;
+    }
+
+    pub(crate) fn add_window_to_queue(&self, window: Window, monitor: Monitor) {
+        todo!()
+    }
+
+    pub(crate) fn move_window_to_queue(&self, window: Window, monitor: Monitor) {
+        todo!()
+    }
+
+    pub(crate) fn add_window_queue(&self, monitor: Monitor) {
+        todo!()
+    }
+
+    pub(crate) fn remove_window_from_queue(&self, window: Window, monitor: Monitor) {
+        todo!()
     }
 
     pub(crate) fn update_input(
@@ -127,8 +146,26 @@ impl<A: Allocator> Context<A> {
         input
     }
 
-    pub(crate) fn fill_cache() {
-        todo!()
+    pub(crate) fn fill_cache(&self) {
+        let monitors = get_monitors_live(self);
+        let windows = get_windows_live(self);
+        let mut window_queues = HashMap::new();
+        for monitor in monitors {
+            let queue = windows
+                .iter()
+                .copied()
+                .filter(|w| w.is_on_monitor(monitor))
+                .collect();
+
+            window_queues.insert(monitor, queue);
+        }
+
+        // SAFETY: Context can't be used by miltiple threads so we only need to worry
+        // about outstanding references which do not exist because we do not give out
+        // any nor retain any.
+        let cache = unsafe { &mut *self.cache.get() };
+        cache.window_queues = window_queues;
+        cache.last_focused_monitor = get_focused_monitor_live();
     }
 }
 
@@ -252,6 +289,7 @@ pub struct Cache {
     key_map: KeyMap,
     monitor_layouts: HashMap<Monitor, Layout>,
     window_queues: HashMap<Monitor, VecDeque<Window>>,
+    last_focused_monitor: Monitor,
 }
 
 #[derive(Default)]

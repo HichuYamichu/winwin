@@ -105,12 +105,17 @@ fn main() {
                     kill_all_windows(&ctx);
                 }
             }
-            Event::WindowOpen(window) => {
-                let monitor = get_monitor_with_window(&ctx, window);
+            Event::WindowOpen(window, monitor) => {
                 let layout = layout_on(&ctx, monitor);
                 apply_layout(&ctx, monitor, layout);
             }
-            Event::WindowClose(window) => {
+            Event::WindowClose(window, monitor) => {
+                // By the time this event is handled the window in question might have been
+                // destroyed, as such it is not recommended to query for its properties. Regardles
+                // of wheather the window is still around or not, it has been evicted from the cache
+                // thus all `get_` functions called for this window will return default/invalid
+                // values.
+                // `monitor` value is valid and designates last monitor the window was on.
                 let monitor = get_monitor_with_window(&ctx, window);
                 let layout = layout_on(&ctx, monitor);
                 apply_layout(&ctx, monitor, layout);

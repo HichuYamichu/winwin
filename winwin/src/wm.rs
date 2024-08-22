@@ -22,6 +22,22 @@ pub struct Window {
     pub handle: HWND,
 }
 
+impl From<HWND> for Window {
+    fn from(handle: HWND) -> Self {
+        Self {
+            handle: HWND(handle.0 as _),
+        }
+    }
+}
+
+impl From<usize> for Window {
+    fn from(handle: usize) -> Self {
+        Self {
+            handle: HWND(handle as _),
+        }
+    }
+}
+
 impl Window {
     pub fn rect(&self) -> Rect {
         let mut rect = RECT::default();
@@ -184,6 +200,20 @@ pub struct Monitor {
     handle: HMONITOR,
 }
 
+impl From<HMONITOR> for Monitor {
+    fn from(handle: HMONITOR) -> Self {
+        Self { handle: handle }
+    }
+}
+
+impl From<usize> for Monitor {
+    fn from(handle: usize) -> Self {
+        Self {
+            handle: HMONITOR(handle as _),
+        }
+    }
+}
+
 impl Monitor {
     pub fn rect(&self) -> Rect {
         let mut info = MONITORINFO {
@@ -266,7 +296,6 @@ where
 {
     // SAFETY: See `save_layout` safety comment.
     let cache = unsafe { &mut *ctx.cache.get() };
-
     *cache.monitor_layouts.get(&monitor).unwrap_or(&Layout::None)
 }
 
@@ -285,6 +314,14 @@ where
     }
 
     Monitor::default()
+}
+
+pub(crate) fn get_monitor_with_window_live<A>(_ctx: &Context<A>, window: Window) -> Monitor
+where
+    A: Allocator + Copy,
+{
+    let handle = unsafe { MonitorFromWindow(window.handle, MONITOR_DEFAULTTONEAREST) };
+    Monitor { handle }
 }
 
 pub fn get_windows_on_monitor<A>(ctx: &Context<A>, monitor: Monitor) -> Vec<Window>
@@ -312,32 +349,31 @@ where
     queues.keys().copied().collect()
 }
 
-pub(crate) fn get_monitors_live<A: Allocator>(ctx: &Context<A>) -> Vec<Monitor, A> {
-    todo!()
-    // unsafe extern "system" fn push_monitor(
-    //     hmonitor: HMONITOR,
-    //     _lprc_clip: HDC,
-    //     _lpfn_enum: *mut RECT,
-    //     lparam: LPARAM,
-    // ) -> BOOL {
-    //     let dest_vec = lparam.0 as *mut Vec<Monitor, &Arena>;
-    //     (*dest_vec).push(Monitor { handle: hmonitor });
-    //
-    //     TRUE
-    // }
-    //
-    // let mut monitors  = Vec::new_in(&ctx.alloc);
-    // let success = unsafe {
-    //     EnumDisplayMonitors(
-    //         HDC(std::ptr::null_mut()),
-    //         None,
-    //         Some(push_monitor),
-    //         LPARAM(&mut monitors as *mut _ as isize),
-    //     )
-    // };
-    // error_if!(!success);
-    //
-    // monitors
+pub(crate) fn get_monitors_live<A: Allocator>(ctx: &Context<A>) -> Vec<Monitor, &Arena> {
+    unsafe extern "system" fn push_monitor(
+        hmonitor: HMONITOR,
+        _lprc_clip: HDC,
+        _lpfn_enum: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let dest_vec = lparam.0 as *mut Vec<Monitor, &Arena>;
+        (*dest_vec).push(Monitor { handle: hmonitor });
+
+        TRUE
+    }
+
+    let mut monitors = Vec::new_in(&ctx.arena);
+    let success = unsafe {
+        EnumDisplayMonitors(
+            HDC(std::ptr::null_mut()),
+            None,
+            Some(push_monitor),
+            LPARAM(&mut monitors as *mut _ as isize),
+        )
+    };
+    error_if!(!success);
+
+    monitors
 }
 
 pub fn get_windows<A>(ctx: &Context<A>) -> Vec<Window>
@@ -355,7 +391,10 @@ where
         .collect()
 }
 
-pub(crate) fn get_windows_live(arena: &Arena) -> Vec<Window, &Arena> {
+pub(crate) fn get_windows_live<A>(ctx: &Context<A>) -> Vec<Window, &Arena>
+where
+    A: Allocator + Copy,
+{
     extern "system" fn push_visible_window(window: HWND, lparam: LPARAM) -> BOOL {
         unsafe {
             let len = GetWindowTextLengthW(window);
@@ -376,7 +415,7 @@ pub(crate) fn get_windows_live(arena: &Arena) -> Vec<Window, &Arena> {
         }
     }
 
-    let mut windows = Vec::new_in(arena);
+    let mut windows = Vec::new_in(&ctx.arena);
     let res = unsafe {
         EnumWindows(
             Some(push_visible_window),
@@ -387,7 +426,7 @@ pub(crate) fn get_windows_live(arena: &Arena) -> Vec<Window, &Arena> {
         Ok(_) => windows,
         Err(e) => {
             tracing::error!(error = ?e);
-            Vec::new_in(arena)
+            Vec::new_in(&ctx.arena)
         }
     }
 }
@@ -396,7 +435,9 @@ pub fn get_focused_monitor<A>(ctx: &Context<A>) -> Monitor
 where
     A: Allocator + Copy,
 {
-    todo!()
+    // SAFETY: See `save_layout` safety comment.
+    let cache = unsafe { &mut *ctx.cache.get() };
+    cache.last_focused_monitor
 }
 
 pub(crate) fn get_focused_monitor_live() -> Monitor {
@@ -409,7 +450,14 @@ pub fn get_focused_window<A>(ctx: &Context<A>) -> Window
 where
     A: Allocator + Copy,
 {
-    todo!()
+    // SAFETY: See `save_layout` safety comment.
+    let cache = unsafe { &mut *ctx.cache.get() };
+    let monitor = cache.last_focused_monitor;
+    let queue = cache.window_queues.get(&monitor);
+    match queue {
+        Some(q) => q.iter().copied().nth(0).unwrap_or(Window::default()),
+        None => Window::default(),
+    }
 }
 
 pub(crate) fn get_focused_window_live() -> Window {
