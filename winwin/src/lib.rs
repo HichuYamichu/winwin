@@ -12,7 +12,6 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::mpsc::SyncSender;
 use std::{alloc, ptr::NonNull};
-use winwin_common::ServerCommand;
 
 pub use winwin_common::{Key, KeyState};
 
@@ -88,54 +87,64 @@ impl<A: Allocator + Copy> Context<A> {
         let cache = unsafe { &mut *self.cache.get() };
         let queues = &mut cache.window_queues;
 
-        let entry = queues.entry(monitor);
-        match entry {
-            Entry::Occupied(_) => {}
-            Entry::Vacant(e) => {
-                // There was no cache entry for this monitor so we only need to create one.
-                e.insert(VecDeque::from([window]));
-                return;
-            }
-        };
-
         // There are three cases:
         // 1. Window was not present in any queue and must be added.
         // 2. Window was in different queue and must be moved.
         // 3. Windows was in correct queue but must be moved to the front.
-        // Looping unconditionaly saves us from figuring out which case we were in. Instead we just
-        // add to correct queue once we know that window does not exist elsewhere.
-        for q in queues.values_mut() {
+        // Looping unconditionaly saves us from figuring out which case we were in. We simply try
+        // to remove from every queue than add it to correct slot.
+        for (_, q) in queues.iter_mut() {
             q.retain(|w| *w != window);
         }
-        let queue = queues
-            .get_mut(&monitor)
-            .expect("if we got here queue must exist");
+        let target_queue_idx = queues
+            .iter()
+            .position(|(m, _)| *m == monitor)
+            .expect("monitor must have its queue");
+        let queue = &mut queues[target_queue_idx].1;
         queue.push_front(window);
 
-        // In order to move window to other monitor it must have been focused.
-        cache.last_focused_monitor = monitor;
-    }
-
-    pub(crate) fn add_window_to_queue(&self, window: Window, monitor: Monitor) {
-        todo!()
-    }
-
-    pub(crate) fn move_window_to_queue(&self, window: Window, monitor: Monitor) {
-        todo!()
+        // We update monitor ordering because moved windows must have been focused.
+        // Removing and insterting seems to be cheap for VecDeque.
+        let queue = queues
+            .remove(target_queue_idx)
+            .expect("monitor must have its queue");
+        queues.push_front(queue);
     }
 
     pub(crate) fn add_window_queue(&self, monitor: Monitor) {
-        todo!()
+        // SAFETY: See safety comment for `update_window_queue`.
+        let cache = unsafe { &mut *self.cache.get() };
+        cache.window_queues.push_back((monitor, VecDeque::new()));
+    }
+
+    pub(crate) fn add_window_to_queue(&self, window: Window, monitor: Monitor) {
+        // SAFETY: See safety comment for `update_window_queue`.
+        let cache = unsafe { &mut *self.cache.get() };
+        let queue = &mut cache
+            .window_queues
+            .iter_mut()
+            .find(|(m, _)| *m == monitor)
+            .expect("monitor must have its queue")
+            .1;
+        queue.push_front(window);
     }
 
     pub(crate) fn remove_window_from_queue(&self, window: Window, monitor: Monitor) {
-        todo!()
+        // SAFETY: See safety comment for `update_window_queue`.
+        let cache = unsafe { &mut *self.cache.get() };
+        let queue = &mut cache
+            .window_queues
+            .iter_mut()
+            .find(|(m, _)| *m == monitor)
+            .expect("monitor must have its queue")
+            .1;
+        queue.retain(|w| *w != window);
     }
 
     pub(crate) fn update_input(
         &self,
         kb_delta: KBDelta,
-        command_tx: SyncSender<ServerCommand>,
+        command_tx: SyncSender<KeyboardOp>,
     ) -> Input<'_> {
         // SAFETY: Context can't be used by miltiple threads so we only need to worry
         // about outstanding references which do not exist because we do not give out
@@ -149,7 +158,7 @@ impl<A: Allocator + Copy> Context<A> {
     pub(crate) fn fill_cache(&self) {
         let monitors = get_monitors_live(self);
         let windows = get_windows_live(self);
-        let mut window_queues = HashMap::new();
+        let mut window_queues = VecDeque::new();
         for monitor in monitors {
             let queue = windows
                 .iter()
@@ -157,7 +166,7 @@ impl<A: Allocator + Copy> Context<A> {
                 .filter(|w| w.is_on_monitor(monitor))
                 .collect();
 
-            window_queues.insert(monitor, queue);
+            window_queues.push_back((monitor, queue));
         }
 
         // SAFETY: Context can't be used by miltiple threads so we only need to worry
@@ -165,7 +174,6 @@ impl<A: Allocator + Copy> Context<A> {
         // any nor retain any.
         let cache = unsafe { &mut *self.cache.get() };
         cache.window_queues = window_queues;
-        cache.last_focused_monitor = get_focused_monitor_live();
     }
 }
 
@@ -288,8 +296,7 @@ impl<I: Iterator> IteratorCollectWithAlloc for I {}
 pub struct Cache {
     key_map: KeyMap,
     monitor_layouts: HashMap<Monitor, Layout>,
-    window_queues: HashMap<Monitor, VecDeque<Window>>,
-    last_focused_monitor: Monitor,
+    window_queues: VecDeque<(Monitor, VecDeque<Window>)>,
 }
 
 #[derive(Default)]
@@ -314,7 +321,7 @@ impl KeyMap {
     pub fn input<'a, A: Allocator>(
         &self,
         ctx: &'a Context<A>,
-        tx: SyncSender<ServerCommand>,
+        tx: SyncSender<KeyboardOp>,
     ) -> Input<'a> {
         let mut pressed_keys = Vec::new_in(&ctx.arena);
 
@@ -336,12 +343,12 @@ impl KeyMap {
 #[derive(Debug)]
 pub struct Input<'a> {
     keys: Vec<Key, &'a Arena>,
-    intercept_tx: SyncSender<ServerCommand>,
+    intercept_tx: SyncSender<KeyboardOp>,
 }
 
 impl<'a> Drop for Input<'a> {
     fn drop(&mut self) {
-        let _ = self.intercept_tx.try_send(ServerCommand::None);
+        let _ = self.intercept_tx.try_send(KeyboardOp::DoNothing);
     }
 }
 
@@ -349,7 +356,7 @@ impl Input<'_> {
     pub fn pressed(&self, key: Key) -> bool {
         let pressed = self.pressed_no_intercept(key);
         if pressed {
-            let _ = self.intercept_tx.try_send(ServerCommand::InterceptKeypress);
+            let _ = self.intercept_tx.try_send(KeyboardOp::InterceptKeypress);
         }
         pressed
     }
@@ -361,7 +368,7 @@ impl Input<'_> {
     pub fn all_pressed(&self, keys: &[Key]) -> bool {
         let pressed = self.all_pressed_no_intercept(keys);
         if pressed {
-            let _ = self.intercept_tx.try_send(ServerCommand::InterceptKeypress);
+            let _ = self.intercept_tx.try_send(KeyboardOp::InterceptKeypress);
         }
         pressed
     }

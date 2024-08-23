@@ -116,7 +116,6 @@ fn main() {
                 // thus all `get_` functions called for this window will return default/invalid
                 // values.
                 // `monitor` value is valid and designates last monitor the window was on.
-                let monitor = get_monitor_with_window(&ctx, window);
                 let layout = layout_on(&ctx, monitor);
                 apply_layout(&ctx, monitor, layout);
             } // TODO: Handle monitor connection/disconection.

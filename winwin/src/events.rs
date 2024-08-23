@@ -1,10 +1,7 @@
-use allocator_api2::alloc::Allocator;
-use allocator_api2::vec::*;
 use core::slice;
 use std::alloc;
-use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::mpsc::{self, sync_channel};
+use std::sync::mpsc::{self, sync_channel, Sender};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 use std::thread::{self};
@@ -15,11 +12,11 @@ use windows::Win32::System::Pipes::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::System::IO::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use winwin_common::{ClientEvent, Rect, ServerCommand, SyncHandle};
+use winwin_common::{ClientEvent, SyncHandle};
 
 use windows::core::{s, PCSTR};
 
-use crate::{wm, Arena, Cache, Context, Input, Key, KeyState, Monitor, Window};
+use crate::{wm, Context, Input, KeyState, Monitor, Window};
 pub use winwin_common::KBDelta;
 
 const THREAD_POOL_SIZE: usize = 2;
@@ -33,6 +30,11 @@ extern "system" {
     fn shell_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
 }
 
+pub enum KeyboardOp {
+    InterceptKeypress,
+    DoNothing,
+}
+
 pub enum Event<'a> {
     KeyPress(Input<'a>),
     WindowOpen(Window, Monitor),
@@ -40,7 +42,8 @@ pub enum Event<'a> {
 }
 
 pub struct EventQueue {
-    ev_rx: Receiver<(ClientEvent, SyncSender<ServerCommand>)>,
+    ev_rx: Receiver<ClientEvent>,
+    kb_op_tx: SyncSender<KeyboardOp>,
 
     // Used for shutdown and cleanup.
     iocp_handle: HANDLE,
@@ -56,19 +59,26 @@ impl EventQueue {
         let (tx, rx) = mpsc::sync_channel(128);
 
         let iocp = create_io_completion_port();
+
+        let (kb_op_tx, kb_op_rx) = mpsc::sync_channel(0);
         let (hook_thread_id_tx, hook_thread_id_rx) = sync_channel(0);
         let hook_thread_event_tx = tx.clone();
 
         let join_handles = [
             thread::spawn(move || unsafe { install_pipe_server(tx, iocp) }),
-            thread::spawn(|| unsafe { install_hooks(hook_thread_event_tx, hook_thread_id_tx) }),
+            thread::spawn(|| unsafe {
+                install_hooks(hook_thread_event_tx, kb_op_rx, hook_thread_id_tx)
+            }),
         ];
 
         // This nonsense in necessary because Rust's ThreadId has nothing to do with actual thread id.
         let hook_thread_id = hook_thread_id_rx.recv().unwrap();
 
+        ctx.fill_cache();
+
         Self {
             ev_rx: rx,
+            kb_op_tx,
 
             iocp_handle: *iocp,
             join_handles,
@@ -81,38 +91,42 @@ impl EventQueue {
         loop {
             ctx.arena.reset();
 
-            let (event, command_tx) = self.ev_rx.recv().unwrap();
+            let event = self.ev_rx.recv().unwrap();
             match event {
                 ClientEvent::Keyboard(kb_delta) => {
-                    let input = ctx.update_input(kb_delta, command_tx);
+                    let input = ctx.update_input(kb_delta, self.kb_op_tx.clone());
                     return Event::KeyPress(input);
                 }
                 ClientEvent::WindowOpen(window_handle, monitor_handle) => {
                     let window = Window::from(window_handle);
                     let monitor = Monitor::from(monitor_handle);
                     ctx.add_window_to_queue(window, monitor);
-
                     return Event::WindowOpen(window, monitor);
                 }
                 ClientEvent::WindowClose(window_handle, monitor_handle) => {
                     let window = Window::from(window_handle);
                     let monitor = Monitor::from(monitor_handle);
                     ctx.remove_window_from_queue(window, monitor);
-
+                    dbg!(window);
                     return Event::WindowClose(window, monitor);
                 }
                 ClientEvent::WindowMonitorChanged(window_handle, monitor_handle) => {
                     let window = Window::from(window_handle);
                     let monitor = Monitor::from(monitor_handle);
-                    ctx.move_window_to_queue(window, monitor);
+                    ctx.update_window_queue(monitor, window);
                 }
-                ClientEvent::WindowFocusHanged(handle) => {
-                    let window = Window::from(handle);
+                ClientEvent::WindowFocusHanged(window_handle) => {
+                    let window = Window::from(window_handle);
                     let monitor = wm::get_monitor_with_window(ctx, window);
                     ctx.update_window_queue(monitor, window);
                 }
-                ClientEvent::MonitorConnected(handle) => {}
-                ClientEvent::MonitorDisconnected(handle) => {}
+                ClientEvent::MonitorConnected(monitor_handle) => {
+                    let monitor = Monitor::from(monitor_handle);
+                    ctx.add_window_queue(monitor);
+                }
+                ClientEvent::MonitorDisconnected(monitro_handle) => {
+                    // TODO: Entire cache has to be recomputed.
+                }
             }
         }
     }
@@ -134,13 +148,14 @@ impl EventQueue {
 }
 
 unsafe fn install_hooks(
-    tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
+    tx: SyncSender<ClientEvent>,
+    rx: Receiver<KeyboardOp>,
     thread_id_tx: SyncSender<u32>,
 ) {
     thread_id_tx
         .send(GetCurrentThreadId())
         .expect("main thread is waiting for this id");
-    KB_SENDER.init(tx);
+    KB_SENDER.init(tx, rx);
 
     let dll_name = s!("hooks.dll");
     let h_instance =
@@ -165,21 +180,28 @@ unsafe fn install_hooks(
 static mut KB_SENDER: KbSender = KbSender::new();
 
 struct KbSender {
-    sender: MaybeUninit<SyncSender<(ClientEvent, SyncSender<ServerCommand>)>>,
+    sender: MaybeUninit<SyncSender<ClientEvent>>,
+    receiver: MaybeUninit<Receiver<KeyboardOp>>,
 }
 
 impl KbSender {
     const fn new() -> Self {
         Self {
             sender: MaybeUninit::uninit(),
+            receiver: MaybeUninit::uninit(),
         }
     }
-    fn init(&mut self, tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>) {
+    fn init(&mut self, tx: SyncSender<ClientEvent>, rx: Receiver<KeyboardOp>) {
         self.sender.write(tx);
+        self.receiver.write(rx);
     }
 
-    unsafe fn get(&self) -> &SyncSender<(ClientEvent, SyncSender<ServerCommand>)> {
+    unsafe fn get_sender(&self) -> &SyncSender<ClientEvent> {
         unsafe { self.sender.assume_init_ref() }
+    }
+
+    unsafe fn get_receiver(&self) -> &Receiver<KeyboardOp> {
+        unsafe { self.receiver.assume_init_ref() }
     }
 }
 
@@ -196,14 +218,14 @@ unsafe extern "system" fn low_level_keyboard_proc(
         };
 
         let event = ClientEvent::Keyboard(kb_delta);
-        let tx = KB_SENDER.get();
-        let (command_tx, command_rx) = sync_channel(1);
-        tx.send((event, command_tx))
+        let tx = KB_SENDER.get_sender();
+        tx.send(event)
             .expect("main thread must be around at this point");
-        let command = command_rx
-            .recv()
-            .expect("hook thread must be around at this point");
-        if matches!(command, ServerCommand::InterceptKeypress) {
+
+        let rx = KB_SENDER.get_receiver();
+        let op = rx.recv().expect("hook thread must be around at this point");
+
+        if matches!(op, KeyboardOp::InterceptKeypress) {
             return LRESULT(-1);
         }
     }
@@ -211,16 +233,13 @@ unsafe extern "system" fn low_level_keyboard_proc(
     return CallNextHookEx(None, code, wparam, lparam);
 }
 
-unsafe fn install_pipe_server(
-    tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
-    iocp: SyncHandle,
-) {
+unsafe fn install_pipe_server(tx: SyncSender<ClientEvent>, iocp: SyncHandle) {
     let mut pool = IocpWorkerPool::new(iocp, tx);
     pool.start_workers_and_accept_connections();
 }
 
 struct IocpWorkerPool {
-    event_tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
+    event_tx: SyncSender<ClientEvent>,
     io_objects_pool: Receiver<usize>,
     io_objects_release_channel: Option<SyncSender<usize>>,
 
@@ -232,10 +251,7 @@ struct IocpWorkerPool {
 }
 
 impl IocpWorkerPool {
-    fn new(
-        iocp: SyncHandle,
-        event_tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
-    ) -> Self {
+    fn new(iocp: SyncHandle, event_tx: SyncSender<ClientEvent>) -> Self {
         let pipe_instance_count = PIPE_INSTANCES_PER_WORKER * THREAD_POOL_SIZE;
         let (io_objects_tx, io_objects_rx) = sync_channel(pipe_instance_count);
 
@@ -374,14 +390,13 @@ impl Default for IoData {
 enum State {
     WaitingForConnection,
     ReadEnqueued,
-    WriteEnqueued,
     WaitingForDisconnect,
 }
 
 unsafe fn handle_iocp(
     iocp: SyncHandle,
     io_objects_release_channel: SyncSender<usize>,
-    event_tx: SyncSender<(ClientEvent, SyncSender<ServerCommand>)>,
+    event_tx: SyncSender<ClientEvent>,
 ) {
     let mut completion_key = 0;
     let mut bytes_transferred = 0;
@@ -433,36 +448,13 @@ unsafe fn handle_iocp(
             State::ReadEnqueued => {
                 let client_event: ClientEvent =
                     bincode::deserialize(&io_data.buffer[..bytes_transferred as usize]).unwrap();
-                let (command_tx, command_rx) = mpsc::sync_channel(1);
                 event_tx
-                    .send((client_event, command_tx))
+                    .send(client_event)
                     .expect("other end should not quit before this thread");
 
-                let command = command_rx.recv().unwrap_or(ServerCommand::None);
-                bincode::serialize_into(&mut io_data.buffer[..], &command).unwrap();
-
-                match enqueue_pipe_write(io_data) {
-                    Ok(_) => io_data.state = State::WriteEnqueued,
-                    Err(e) => {
-                        tracing::warn!(?e);
-                        io_objects_release_channel
-                            .send(io_data.as_usize())
-                            .expect("pool never quits before workers");
-                    }
-                }
-            }
-            State::WriteEnqueued => {
-                // Enqueue dummy read so that client disconnection triggers iocp.
-                match enqueue_pipe_read(io_data) {
-                    Ok(_) => io_data.state = State::WaitingForDisconnect,
-                    Err(_) => {
-                        // If client released their handle already we get here.
-                        // If not then `GetQueuedCompletionStatus` will catch this.
-                        io_objects_release_channel
-                            .send(io_data.as_usize())
-                            .expect("pool never quits before workers");
-                    }
-                }
+                io_objects_release_channel
+                    .send(io_data as *mut _ as _)
+                    .expect("pool never quits before workers");
             }
             State::WaitingForDisconnect => {
                 unreachable!("client disconnection will be catched before this match statement");

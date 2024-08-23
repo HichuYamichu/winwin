@@ -5,12 +5,13 @@ use windows::Win32::Storage::FileSystem::*;
 use windows::Win32::System::Pipes::*;
 use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows::Win32::System::Threading::*;
+use windows::Win32::System::IO::OVERLAPPED;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::fmt::Subscriber;
 
-use winwin_common::{ClientEvent, KBDelta, KeyState, Rect, ServerCommand};
+use winwin_common::{ClientEvent, KBDelta, KeyState, Rect};
 
 const PIPE_NAME: PCSTR = s!("\\\\.\\pipe\\winwin_pipe");
 const BUFFER_SIZE: usize = 512;
@@ -44,6 +45,7 @@ enum HookError {
     #[allow(dead_code)]
     Windows(windows::core::Error),
     Serde,
+    Timeout,
 }
 
 impl From<windows::core::Error> for HookError {
@@ -55,6 +57,16 @@ impl From<windows::core::Error> for HookError {
 impl From<bincode::Error> for HookError {
     fn from(_value: bincode::Error) -> Self {
         Self::Serde
+    }
+}
+
+struct DroppingHandle {
+    handle: HANDLE,
+}
+
+impl Drop for DroppingHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -82,12 +94,23 @@ pub unsafe extern "system" fn shell_proc(code: i32, wparam: WPARAM, lparam: LPAR
         }
     }
 
-    if code == HSHELL_MONITORCHANGED as _ {
+    // if code == HSHELL_MONITORCHANGED as _ {
+    //     let hwnd = HWND(wparam.0 as _);
+    //     let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    //
+    //     if is_real_window(hwnd) {
+    //         let event = ClientEvent::WindowMonitorChanged(hwnd.0 as _, hmonitor.0 as _);
+    //         if let Err(e) = send_event(event) {
+    //             tracing::warn!(?e);
+    //         }
+    //     }
+    // }
+    //
+    if code == HSHELL_WINDOWACTIVATED as _ {
         let hwnd = HWND(wparam.0 as _);
-        let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
 
         if is_real_window(hwnd) {
-            let event = ClientEvent::WindowMonitorChanged(hwnd.0 as _, hmonitor.0 as _);
+            let event = ClientEvent::WindowFocusHanged(hwnd.0 as _);
             if let Err(e) = send_event(event) {
                 tracing::warn!(?e);
             }
@@ -102,8 +125,11 @@ pub unsafe extern "system" fn cbt_proc(code: i32, wparam: WPARAM, lparam: LPARAM
     return CallNextHookEx(None, code, wparam, lparam);
 }
 
-unsafe fn send_event(event: ClientEvent) -> Result<ServerCommand, HookError> {
-    WaitNamedPipeA(PIPE_NAME, INFINITE)?;
+unsafe fn send_event(event: ClientEvent) -> Result<(), HookError> {
+    const TIMEOUT: u32 = 1000;
+
+    WaitNamedPipeA(PIPE_NAME, TIMEOUT)?;
+
     let pipe = unsafe {
         CreateFileA(
             PIPE_NAME,
@@ -115,30 +141,37 @@ unsafe fn send_event(event: ClientEvent) -> Result<ServerCommand, HookError> {
             None,
         )?
     };
+    let _guard = DroppingHandle { handle: pipe };
 
     let mut buffer = [0u8; BUFFER_SIZE];
     bincode::serialize_into(buffer.as_mut_slice(), &event)?;
+
     let mut bytes_written = 0;
+    let mut overlapped = std::mem::zeroed::<OVERLAPPED>();
 
     unsafe {
-        WriteFile(
+        let res = WriteFile(
             pipe,
             Some(buffer.as_slice()),
             Some(&mut bytes_written),
-            None,
-        )?;
+            Some(&mut overlapped),
+        );
+        match res {
+            Ok(_) => {}
+            Err(e) => {
+                let code = e.code();
+                tracing::warn!(?code);
+                if e.code() == ERROR_IO_PENDING.into() {
+                    if WaitForSingleObject(overlapped.hEvent, TIMEOUT) == WAIT_TIMEOUT {
+                        return Err(HookError::Timeout);
+                    }
+                }
+                return Err(HookError::Windows(e));
+            }
+        }
     }
-
-    let mut bytes_read = 0;
-    unsafe {
-        ReadFile(pipe, Some(&mut buffer), Some(&mut bytes_read), None)?;
-    };
-
-    let server_command: ServerCommand = bincode::deserialize(&buffer[..bytes_read as usize])?;
-
-    unsafe { CloseHandle(pipe)? };
-
-    Ok(server_command)
+    tracing::warn!("after first write");
+    Ok(())
 }
 
 fn is_real_window(handle: HWND) -> bool {

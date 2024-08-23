@@ -23,13 +23,6 @@ impl Deref for SyncHandle {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum ServerCommand {
-    InterceptKeypress,
-    ChangeWindowRect(Rect),
-    None,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub enum ClientEvent {
     WindowOpen(usize, usize),
     WindowClose(usize, usize),

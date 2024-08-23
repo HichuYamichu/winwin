@@ -257,7 +257,7 @@ fn get_dpi_for_monitor(monitor: Monitor) -> (u32, u32) {
     (dpi_x, dpi_y)
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub enum Layout {
     #[default]
     None,
@@ -332,8 +332,10 @@ where
     let cache = unsafe { &mut *ctx.cache.get() };
     let queues = &cache.window_queues;
     queues
-        .get(&monitor)
-        .unwrap_or(&VecDeque::new())
+        .iter()
+        .find(|(m, _)| *m == monitor)
+        .unwrap_or(queues.front().unwrap())
+        .1
         .iter()
         .copied()
         .collect()
@@ -346,7 +348,7 @@ where
     // SAFETY: See `save_layout` safety comment.
     let cache = unsafe { &mut *ctx.cache.get() };
     let queues = &cache.window_queues;
-    queues.keys().copied().collect()
+    queues.iter().map(|(m, _)| m).copied().collect()
 }
 
 pub(crate) fn get_monitors_live<A: Allocator>(ctx: &Context<A>) -> Vec<Monitor, &Arena> {
@@ -381,11 +383,11 @@ where
     A: Allocator + Copy,
 {
     // SAFETY: See `save_layout` safety comment.
-    let cache = unsafe { &mut *ctx.cache.get() };
+    let cache = unsafe { &*ctx.cache.get() };
     let queues = &cache.window_queues;
     queues
-        .values()
-        .map(|q| q.iter())
+        .iter()
+        .map(|(_, q)| q.iter())
         .flatten()
         .copied()
         .collect()
@@ -436,8 +438,12 @@ where
     A: Allocator + Copy,
 {
     // SAFETY: See `save_layout` safety comment.
-    let cache = unsafe { &mut *ctx.cache.get() };
-    cache.last_focused_monitor
+    let cache = unsafe { &*ctx.cache.get() };
+    cache
+        .window_queues
+        .front()
+        .expect("there is at least one monitor")
+        .0
 }
 
 pub(crate) fn get_focused_monitor_live() -> Monitor {
@@ -451,13 +457,14 @@ where
     A: Allocator + Copy,
 {
     // SAFETY: See `save_layout` safety comment.
-    let cache = unsafe { &mut *ctx.cache.get() };
-    let monitor = cache.last_focused_monitor;
-    let queue = cache.window_queues.get(&monitor);
-    match queue {
-        Some(q) => q.iter().copied().nth(0).unwrap_or(Window::default()),
-        None => Window::default(),
-    }
+    let cache = unsafe { &*ctx.cache.get() };
+    *cache
+        .window_queues
+        .front()
+        .unwrap()
+        .1
+        .front()
+        .unwrap_or(&Window::default())
 }
 
 pub(crate) fn get_focused_window_live() -> Window {

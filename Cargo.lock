@@ -93,7 +93,6 @@ name = "hooks"
 version = "0.1.0"
 dependencies = [
  "bincode",
- "once_cell",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -521,9 +520,7 @@ version = "0.1.0"
 dependencies = [
  "allocator-api2",
  "bincode",
- "crossbeam",
  "hooks",
- "once_cell",
  "serde",
  "tracing",
  "tracing-subscriber",
