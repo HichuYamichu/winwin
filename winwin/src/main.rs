@@ -17,9 +17,7 @@ fn main() {
     let mod_key = Key::AltLeft;
     let ctx = Context::new();
 
-    // SAFETY: There can be only one `EventQueue` at a time and it must be pulled for events or shutdown.
-    // This is the only place and time where `EventQueue` is constructed and we pool right after so
-    // this is safe and correct.
+    // SAFETY: There can be only one `EventQueue` at a time.
     let mut queue = unsafe { EventQueue::new(&ctx) };
     loop {
         let event = queue.next_event(&ctx);
@@ -30,7 +28,16 @@ fn main() {
                     break;
                 }
 
-                // Change focused window.
+                // Focus switching.
+                if input.all_pressed(&[mod_key, Key::ShiftLeft, Key::J]) {
+                    focus_next_window(&ctx);
+                }
+
+                if input.all_pressed(&[mod_key, Key::ShiftLeft, Key::K]) {
+                    focus_prev_window(&ctx);
+                }
+
+                // 2d window navigation.
                 if input.all_pressed(&[mod_key, Key::L]) {
                     move_focus(&ctx, Direction::Right);
                 }
@@ -92,7 +99,16 @@ fn main() {
                 // Moving windows across monitors.
                 if input.all_pressed(&[mod_key, Key::Right]) {
                     let window = get_focused_window(&ctx);
-                    send_in(&ctx, window, Direction::Right);
+                    let monitors = get_monitors(&ctx);
+
+                    dbg!(window.title());
+                    send(&ctx, window, monitors[2]);
+                }
+
+                // Swap windows on monitors.
+                if input.all_pressed(&[mod_key, Key::P]) {
+                    let monitors = get_monitors(&ctx);
+                    swap_monitors(&ctx, monitors[0], monitors[2]);
                 }
 
                 // Window closing.

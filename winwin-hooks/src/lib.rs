@@ -11,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::fmt::Subscriber;
 
-use winwin_common::{ClientEvent, KBDelta, KeyState, Rect};
+use winwin_common::{ClientEvent, Rect};
 
 const PIPE_NAME: PCSTR = s!("\\\\.\\pipe\\winwin_pipe");
 const BUFFER_SIZE: usize = 512;

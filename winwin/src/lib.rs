@@ -3,9 +3,7 @@ use allocator_api2::alloc::Allocator;
 use allocator_api2::alloc::Global as GlobalAllocator;
 use allocator_api2::vec::Vec;
 use std::cell::Cell;
-use std::cell::RefCell;
 use std::cell::UnsafeCell;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -22,28 +20,32 @@ mod wm;
 pub use wm::*;
 
 #[macro_export]
-macro_rules! error_if_err {
-    ($result:expr) => {
-        if let Err(e) = $result {
-            tracing::error!(error = ?e);
-        }
+macro_rules! trace_result {
+    ($($result:expr),* $(,)?) => {
+        $(
+            if let Err(e) = $result {
+                tracing::error!(error = ?e);
+            }
+        )*
     };
 }
 
 #[macro_export]
-macro_rules! error_if {
-    ($failed:expr) => {
-        if $failed.as_bool() {
-            let e = windows::core::Error::from_win32();
-            tracing::error!(error = ?e);
-        }
+macro_rules! trace_result_b {
+    ($($success:expr),* $(,)?) => {
+        $(
+            if !$success.as_bool() {
+                let e = windows::core::Error::from_win32();
+                tracing::error!(error = ?e);
+            }
+        )*
     };
 }
 
 pub struct Context<A: Allocator = GlobalAllocator> {
     arena: Arena,
     alloc: A,
-    cache: UnsafeCell<Cache>,
+    cache: Cache,
 
     // Make `Context` !Send and !Sync.
     _marker: PhantomData<*mut ()>,
@@ -58,7 +60,7 @@ impl Context<GlobalAllocator> {
         Self {
             arena,
             alloc,
-            cache: UnsafeCell::new(cache),
+            cache: cache,
 
             _marker: PhantomData,
         }
@@ -73,109 +75,14 @@ impl<A: Allocator> Context<A> {
         Self {
             arena,
             alloc: a,
-            cache: UnsafeCell::new(cache),
+            cache: cache,
 
             _marker: PhantomData,
         }
     }
 }
 
-impl<A: Allocator + Copy> Context<A> {
-    pub(crate) fn update_window_queue(&self, monitor: Monitor, window: Window) {
-        // SAFETY: We do not create nor retain any references to cache data, everything is copied
-        // out of the cache.
-        let cache = unsafe { &mut *self.cache.get() };
-        let queues = &mut cache.window_queues;
-
-        // There are three cases:
-        // 1. Window was not present in any queue and must be added.
-        // 2. Window was in different queue and must be moved.
-        // 3. Windows was in correct queue but must be moved to the front.
-        // Looping unconditionaly saves us from figuring out which case we were in. We simply try
-        // to remove from every queue than add it to correct slot.
-        for (_, q) in queues.iter_mut() {
-            q.retain(|w| *w != window);
-        }
-        let target_queue_idx = queues
-            .iter()
-            .position(|(m, _)| *m == monitor)
-            .expect("monitor must have its queue");
-        let queue = &mut queues[target_queue_idx].1;
-        queue.push_front(window);
-
-        // We update monitor ordering because moved windows must have been focused.
-        // Removing and insterting seems to be cheap for VecDeque.
-        let queue = queues
-            .remove(target_queue_idx)
-            .expect("monitor must have its queue");
-        queues.push_front(queue);
-    }
-
-    pub(crate) fn add_window_queue(&self, monitor: Monitor) {
-        // SAFETY: See safety comment for `update_window_queue`.
-        let cache = unsafe { &mut *self.cache.get() };
-        cache.window_queues.push_back((monitor, VecDeque::new()));
-    }
-
-    pub(crate) fn add_window_to_queue(&self, window: Window, monitor: Monitor) {
-        // SAFETY: See safety comment for `update_window_queue`.
-        let cache = unsafe { &mut *self.cache.get() };
-        let queue = &mut cache
-            .window_queues
-            .iter_mut()
-            .find(|(m, _)| *m == monitor)
-            .expect("monitor must have its queue")
-            .1;
-        queue.push_front(window);
-    }
-
-    pub(crate) fn remove_window_from_queue(&self, window: Window, monitor: Monitor) {
-        // SAFETY: See safety comment for `update_window_queue`.
-        let cache = unsafe { &mut *self.cache.get() };
-        let queue = &mut cache
-            .window_queues
-            .iter_mut()
-            .find(|(m, _)| *m == monitor)
-            .expect("monitor must have its queue")
-            .1;
-        queue.retain(|w| *w != window);
-    }
-
-    pub(crate) fn update_input(
-        &self,
-        kb_delta: KBDelta,
-        command_tx: SyncSender<KeyboardOp>,
-    ) -> Input<'_> {
-        // SAFETY: Context can't be used by miltiple threads so we only need to worry
-        // about outstanding references which do not exist because we do not give out
-        // any nor retain any.
-        let cache = unsafe { &mut *self.cache.get() };
-        cache.key_map.update(kb_delta);
-        let input = cache.key_map.input(self, command_tx);
-        input
-    }
-
-    pub(crate) fn fill_cache(&self) {
-        let monitors = get_monitors_live(self);
-        let windows = get_windows_live(self);
-        let mut window_queues = VecDeque::new();
-        for monitor in monitors {
-            let queue = windows
-                .iter()
-                .copied()
-                .filter(|w| w.is_on_monitor(monitor))
-                .collect();
-
-            window_queues.push_back((monitor, queue));
-        }
-
-        // SAFETY: Context can't be used by miltiple threads so we only need to worry
-        // about outstanding references which do not exist because we do not give out
-        // any nor retain any.
-        let cache = unsafe { &mut *self.cache.get() };
-        cache.window_queues = window_queues;
-    }
-}
+impl<A: Allocator + Copy> Context<A> {}
 
 pub struct Arena {
     mem: NonNull<u8>,
@@ -292,11 +199,211 @@ pub trait IteratorCollectWithAlloc: Iterator {
 
 impl<I: Iterator> IteratorCollectWithAlloc for I {}
 
+// TODO: Add Allocator bound to cache containers once it stabilizes.
 #[derive(Default)]
 pub struct Cache {
+    inner: UnsafeCell<InnerCache>,
+}
+
+#[derive(Default)]
+struct InnerCache {
     key_map: KeyMap,
     monitor_layouts: HashMap<Monitor, Layout>,
     window_queues: VecDeque<(Monitor, VecDeque<Window>)>,
+}
+
+impl Cache {
+    pub(crate) fn save_layout(&self, monitor: Monitor, layout: Layout) {
+        // SAFETY: We do not create nor retain any references to cache data, everything is copied
+        // out of the cache.
+        let cache = unsafe { &mut *self.inner.get() };
+        cache.monitor_layouts.insert(monitor, layout);
+    }
+
+    pub(crate) fn layout_on(&self, monitor: Monitor) -> Layout {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &mut *self.inner.get() };
+        *cache.monitor_layouts.get(&monitor).unwrap_or(&Layout::None)
+    }
+
+    pub(crate) fn update_window_queue(&self, monitor: Monitor, window: Window) {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &mut *self.inner.get() };
+        let queues = &mut cache.window_queues;
+
+        // There are three cases:
+        // 1. Window was not present in any queue and must be added.
+        // 2. Window was in different queue and must be moved.
+        // 3. Windows was in correct queue but must be moved to the front.
+        // Looping unconditionaly saves us from figuring out which case we were in. We simply try
+        // to remove from every queue than add it to correct slot.
+        for (_, q) in queues.iter_mut() {
+            q.retain(|w| *w != window);
+        }
+        let target_queue_idx = queues
+            .iter()
+            .position(|(m, _)| *m == monitor)
+            .expect("monitor must have its queue");
+        let queue = &mut queues[target_queue_idx].1;
+        queue.push_front(window);
+
+        // We update monitor ordering because moved windows must have been focused.
+        // Removing and insterting seems to be cheap for VecDeque.
+        let queue = queues
+            .remove(target_queue_idx)
+            .expect("monitor must have its queue");
+        queues.push_front(queue);
+    }
+
+    pub(crate) fn add_window_queue(&self, monitor: Monitor) {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &mut *self.inner.get() };
+        cache.window_queues.push_back((monitor, VecDeque::new()));
+    }
+
+    pub(crate) fn add_window_to_queue(&self, window: Window, monitor: Monitor) {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &mut *self.inner.get() };
+        let queue = &mut cache
+            .window_queues
+            .iter_mut()
+            .find(|(m, _)| *m == monitor)
+            .expect("monitor must have its queue")
+            .1;
+        queue.push_front(window);
+    }
+
+    pub(crate) fn remove_window_from_queue(&self, window: Window, monitor: Monitor) {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &mut *self.inner.get() };
+        let queue = &mut cache
+            .window_queues
+            .iter_mut()
+            .find(|(m, _)| *m == monitor)
+            .expect("monitor must have its queue")
+            .1;
+        queue.retain(|w| *w != window);
+    }
+
+    pub(crate) fn update_input<A>(
+        &self,
+        ctx: &Context<A>,
+        kb_delta: KBDelta,
+        command_tx: SyncSender<KeyboardOp>,
+    ) -> Input<A>
+    where
+        A: Allocator + Copy,
+    {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &mut *self.inner.get() };
+        cache.key_map.update(kb_delta);
+        let input = cache.key_map.input(ctx, command_tx);
+        input
+    }
+
+    pub(crate) fn fill<A>(&self, ctx: &Context<A>)
+    where
+        A: Allocator + Copy,
+    {
+        let monitors = get_monitors_live(ctx);
+        let windows = get_windows_live(ctx);
+        let mut window_queues = VecDeque::new();
+        for monitor in monitors {
+            let queue = windows
+                .iter()
+                .copied()
+                .filter(|w| w.is_on_monitor(monitor))
+                .collect();
+
+            window_queues.push_back((monitor, queue));
+        }
+
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &mut *self.inner.get() };
+        cache.window_queues = window_queues;
+    }
+
+    pub(crate) fn monitor_with_window(&self, window: Window) -> Monitor {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &mut *self.inner.get() };
+        let queues = &cache.window_queues;
+
+        for (k, q) in queues.iter() {
+            if q.contains(&window) {
+                return *k;
+            }
+        }
+
+        Monitor::default()
+    }
+
+    pub(crate) fn windows_on_monitor<A>(&self, ctx: &Context<A>, monitor: Monitor) -> Vec<Window, A>
+    where
+        A: Allocator + Copy,
+    {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &*self.inner.get() };
+        let queues = &cache.window_queues;
+        queues
+            .iter()
+            .find(|(m, _)| *m == monitor)
+            .unwrap_or(queues.front().unwrap())
+            .1
+            .iter()
+            .copied()
+            .collect_with(ctx.alloc)
+    }
+
+    pub(crate) fn monitors<A>(&self, ctx: &Context<A>) -> Vec<Monitor, A>
+    where
+        A: Allocator + Copy,
+    {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &*self.inner.get() };
+        let queues = &cache.window_queues;
+        queues
+            .iter()
+            .map(|(m, _)| m)
+            .copied()
+            .collect_with(ctx.alloc)
+    }
+
+    pub(crate) fn windows<A>(&self, ctx: &Context<A>) -> Vec<Window, A>
+    where
+        A: Allocator + Copy,
+    {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &*self.inner.get() };
+        let queues = &cache.window_queues;
+        queues
+            .iter()
+            .map(|(_, q)| q.iter())
+            .flatten()
+            .copied()
+            .collect_with(ctx.alloc)
+    }
+
+    pub(crate) fn focused_monitor(&self) -> Monitor {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &*self.inner.get() };
+        cache
+            .window_queues
+            .front()
+            .expect("there is at least one monitor")
+            .0
+    }
+
+    pub(crate) fn focused_window(&self) -> Window {
+        // SAFETY: See safety section for `save_layout`.
+        let cache = unsafe { &*self.inner.get() };
+        *cache
+            .window_queues
+            .front()
+            .unwrap()
+            .1
+            .front()
+            .unwrap_or(&Window::default())
+    }
 }
 
 #[derive(Default)]
@@ -318,12 +425,11 @@ impl KeyMap {
         }
     }
 
-    pub fn input<'a, A: Allocator>(
-        &self,
-        ctx: &'a Context<A>,
-        tx: SyncSender<KeyboardOp>,
-    ) -> Input<'a> {
-        let mut pressed_keys = Vec::new_in(&ctx.arena);
+    pub fn input<'a, A>(&self, ctx: &'a Context<A>, tx: SyncSender<KeyboardOp>) -> Input<A>
+    where
+        A: Allocator + Copy,
+    {
+        let mut pressed_keys = Vec::new_in(ctx.alloc);
 
         for i in 0..256 {
             let idx = i / 32;
@@ -341,18 +447,18 @@ impl KeyMap {
 }
 
 #[derive(Debug)]
-pub struct Input<'a> {
-    keys: Vec<Key, &'a Arena>,
+pub struct Input<A: Allocator> {
+    keys: Vec<Key, A>,
     intercept_tx: SyncSender<KeyboardOp>,
 }
 
-impl<'a> Drop for Input<'a> {
+impl<A: Allocator> Drop for Input<A> {
     fn drop(&mut self) {
         let _ = self.intercept_tx.try_send(KeyboardOp::DoNothing);
     }
 }
 
-impl Input<'_> {
+impl<A: Allocator> Input<A> {
     pub fn pressed(&self, key: Key) -> bool {
         let pressed = self.pressed_no_intercept(key);
         if pressed {

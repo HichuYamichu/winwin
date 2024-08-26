@@ -1,7 +1,8 @@
+use allocator_api2::alloc::Allocator;
 use core::slice;
 use std::alloc;
 use std::mem::MaybeUninit;
-use std::sync::mpsc::{self, sync_channel, Sender};
+use std::sync::mpsc::{self, sync_channel};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 use std::thread::{self};
@@ -35,15 +36,15 @@ pub enum KeyboardOp {
     DoNothing,
 }
 
-pub enum Event<'a> {
-    KeyPress(Input<'a>),
+pub enum Event<A: Allocator> {
+    KeyPress(Input<A>),
     WindowOpen(Window, Monitor),
     WindowClose(Window, Monitor),
 }
 
 pub struct EventQueue {
-    ev_rx: Receiver<ClientEvent>,
-    kb_op_tx: SyncSender<KeyboardOp>,
+    client_event_rx: Receiver<ClientEvent>,
+    keyboard_tx: SyncSender<KeyboardOp>,
 
     // Used for shutdown and cleanup.
     iocp_handle: HANDLE,
@@ -60,71 +61,72 @@ impl EventQueue {
 
         let iocp = create_io_completion_port();
 
-        let (kb_op_tx, kb_op_rx) = mpsc::sync_channel(0);
+        let (kb_tx, kb_rx) = mpsc::sync_channel(0);
         let (hook_thread_id_tx, hook_thread_id_rx) = sync_channel(0);
-        let hook_thread_event_tx = tx.clone();
+        let keyboard_hook_tx = tx.clone();
 
-        let join_handles = [
-            thread::spawn(move || unsafe { install_pipe_server(tx, iocp) }),
-            thread::spawn(|| unsafe {
-                install_hooks(hook_thread_event_tx, kb_op_rx, hook_thread_id_tx)
-            }),
-        ];
+        let hook_thread_handle =
+            thread::spawn(|| unsafe { install_hooks(keyboard_hook_tx, kb_rx, hook_thread_id_tx) });
+        let pipe_server_handle = thread::spawn(move || unsafe { install_pipe_server(tx, iocp) });
 
         // This nonsense in necessary because Rust's ThreadId has nothing to do with actual thread id.
         let hook_thread_id = hook_thread_id_rx.recv().unwrap();
 
-        ctx.fill_cache();
+        ctx.cache.fill(ctx);
 
         Self {
-            ev_rx: rx,
-            kb_op_tx,
+            client_event_rx: rx,
+            keyboard_tx: kb_tx,
 
             iocp_handle: *iocp,
-            join_handles,
+            join_handles: [hook_thread_handle, pipe_server_handle],
             hook_thread_id,
         }
     }
 
-    pub fn next_event<'a>(&mut self, ctx: &'a Context) -> Event<'a> {
+    pub fn next_event<A>(&mut self, ctx: &Context<A>) -> Event<A>
+    where
+        A: Allocator + Copy,
+    {
         // We loop here because we don't want to return to user code on events that we can handle by ourselves.
         loop {
             ctx.arena.reset();
 
-            let event = self.ev_rx.recv().unwrap();
+            let event = self.client_event_rx.recv().unwrap();
             match event {
                 ClientEvent::Keyboard(kb_delta) => {
-                    let input = ctx.update_input(kb_delta, self.kb_op_tx.clone());
+                    let input = ctx
+                        .cache
+                        .update_input(ctx, kb_delta, self.keyboard_tx.clone());
                     return Event::KeyPress(input);
                 }
                 ClientEvent::WindowOpen(window_handle, monitor_handle) => {
                     let window = Window::from(window_handle);
                     let monitor = Monitor::from(monitor_handle);
-                    ctx.add_window_to_queue(window, monitor);
+                    ctx.cache.add_window_to_queue(window, monitor);
                     return Event::WindowOpen(window, monitor);
                 }
                 ClientEvent::WindowClose(window_handle, monitor_handle) => {
                     let window = Window::from(window_handle);
                     let monitor = Monitor::from(monitor_handle);
-                    ctx.remove_window_from_queue(window, monitor);
-                    dbg!(window);
+                    ctx.cache.remove_window_from_queue(window, monitor);
                     return Event::WindowClose(window, monitor);
                 }
                 ClientEvent::WindowMonitorChanged(window_handle, monitor_handle) => {
                     let window = Window::from(window_handle);
                     let monitor = Monitor::from(monitor_handle);
-                    ctx.update_window_queue(monitor, window);
+                    ctx.cache.update_window_queue(monitor, window);
                 }
                 ClientEvent::WindowFocusHanged(window_handle) => {
                     let window = Window::from(window_handle);
                     let monitor = wm::get_monitor_with_window(ctx, window);
-                    ctx.update_window_queue(monitor, window);
+                    ctx.cache.update_window_queue(monitor, window);
                 }
                 ClientEvent::MonitorConnected(monitor_handle) => {
                     let monitor = Monitor::from(monitor_handle);
-                    ctx.add_window_queue(monitor);
+                    ctx.cache.add_window_queue(monitor);
                 }
-                ClientEvent::MonitorDisconnected(monitro_handle) => {
+                ClientEvent::MonitorDisconnected(monitor_handle) => {
                     // TODO: Entire cache has to be recomputed.
                 }
             }
@@ -155,14 +157,22 @@ unsafe fn install_hooks(
     thread_id_tx
         .send(GetCurrentThreadId())
         .expect("main thread is waiting for this id");
-    KB_SENDER.init(tx, rx);
+    KB_HANDLER.init(tx, rx);
+
+    let main_h_instance =
+        GetModuleHandleA(None).expect("loading handle to current exe should always succseed");
+    let kb_hook = SetWindowsHookExA(
+        WH_KEYBOARD_LL,
+        Some(low_level_keyboard_proc),
+        main_h_instance,
+        0,
+    )
+    .unwrap();
 
     let dll_name = s!("hooks.dll");
     let h_instance =
         GetModuleHandleA(dll_name).expect("required dll has to be loaded at this point");
 
-    let kb_hook =
-        SetWindowsHookExA(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), h_instance, 0).unwrap();
     let cbt_hook = SetWindowsHookExA(WH_CBT, Some(cbt_proc), h_instance, 0).unwrap();
     let shell_hook = SetWindowsHookExA(WH_SHELL, Some(shell_proc), h_instance, 0).unwrap();
 
@@ -177,14 +187,14 @@ unsafe fn install_hooks(
     tracing::trace!("hooks unloaded");
 }
 
-static mut KB_SENDER: KbSender = KbSender::new();
+static mut KB_HANDLER: KeyboardHandler = KeyboardHandler::new();
 
-struct KbSender {
+struct KeyboardHandler {
     sender: MaybeUninit<SyncSender<ClientEvent>>,
     receiver: MaybeUninit<Receiver<KeyboardOp>>,
 }
 
-impl KbSender {
+impl KeyboardHandler {
     const fn new() -> Self {
         Self {
             sender: MaybeUninit::uninit(),
@@ -218,12 +228,14 @@ unsafe extern "system" fn low_level_keyboard_proc(
         };
 
         let event = ClientEvent::Keyboard(kb_delta);
-        let tx = KB_SENDER.get_sender();
+        let tx = KB_HANDLER.get_sender();
         tx.send(event)
-            .expect("main thread must be around at this point");
+            .expect("main thread must still be around at this point");
 
-        let rx = KB_SENDER.get_receiver();
-        let op = rx.recv().expect("hook thread must be around at this point");
+        let rx = KB_HANDLER.get_receiver();
+        let op = rx
+            .recv()
+            .expect("hook thread must still be around at this point");
 
         if matches!(op, KeyboardOp::InterceptKeypress) {
             return LRESULT(-1);

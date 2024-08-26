@@ -1,6 +1,5 @@
 use allocator_api2::alloc::Allocator;
 use allocator_api2::vec::*;
-use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::mem::MaybeUninit;
 use windows::Win32::UI::HiDpi::*;
@@ -8,7 +7,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::{Win32::Foundation::*, Win32::Graphics::Gdi::*, Win32::System::Threading::*};
 use winwin_common::Rect;
 
-use crate::{error_if, error_if_err, Arena, Context, IteratorCollectWithAlloc};
+use crate::{trace_result, trace_result_b, Arena, Context, IteratorCollectWithAlloc};
 
 pub enum Direction {
     Left,
@@ -65,8 +64,9 @@ impl Window {
         unsafe {
             let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
             placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-            let res = GetWindowPlacement(self.handle, &mut placement);
-            error_if_err!(res);
+            trace_result! {
+                 GetWindowPlacement(self.handle, &mut placement)
+            };
 
             if placement.showCmd == SW_MAXIMIZE.0 as _ {
                 let res = PostMessageA(
@@ -75,7 +75,7 @@ impl Window {
                     WPARAM(SC_RESTORE as _),
                     LPARAM(0),
                 );
-                error_if_err!(res);
+                trace_result!(res);
             }
 
             let res = SetWindowPos(
@@ -87,7 +87,7 @@ impl Window {
                 rect.height,
                 SWP_NOACTIVATE,
             );
-            error_if_err!(res);
+            trace_result!(res);
         };
     }
 
@@ -111,8 +111,7 @@ impl Window {
             cbSize: core::mem::size_of::<WINDOWINFO>() as u32,
             ..Default::default()
         };
-        let res = unsafe { GetWindowInfo(self.handle, &mut info) };
-        error_if_err!(res);
+        // let res = unsafe { GetWindowInfo(self.handle, &mut info) };
 
         todo!()
     }
@@ -131,16 +130,20 @@ impl Window {
         unsafe {
             let current_thread_id = GetCurrentThreadId();
             let foreground_thread_id = GetWindowThreadProcessId(GetForegroundWindow(), None);
-            let success = AttachThreadInput(current_thread_id, foreground_thread_id, TRUE);
-            error_if!(!success);
+            trace_result_b! {
+                AttachThreadInput(current_thread_id, foreground_thread_id, TRUE)
+            };
 
-            error_if_err!(BringWindowToTop(self.handle));
+            trace_result! {
+                BringWindowToTop(self.handle)
+            };
 
             let _was_visible = ShowWindow(self.handle, SW_SHOW);
             let _was_set = SetForegroundWindow(self.handle);
 
-            let success = AttachThreadInput(current_thread_id, foreground_thread_id, FALSE);
-            error_if!(!success);
+            trace_result_b! {
+                AttachThreadInput(current_thread_id, foreground_thread_id, FALSE)
+            };
         };
     }
 
@@ -148,8 +151,9 @@ impl Window {
         unsafe {
             let mut placement: WINDOWPLACEMENT = std::mem::zeroed();
             placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-            let res = GetWindowPlacement(self.handle, &mut placement);
-            error_if_err!(res);
+            trace_result! {
+                GetWindowPlacement(self.handle, &mut placement)
+            };
 
             if placement.showCmd == SW_MAXIMIZE.0 as _ {
                 let res = PostMessageA(
@@ -158,7 +162,7 @@ impl Window {
                     WPARAM(SC_RESTORE as _),
                     LPARAM(0),
                 );
-                error_if_err!(res);
+                trace_result!(res);
             }
 
             let res = PostMessageA(
@@ -167,7 +171,7 @@ impl Window {
                 WPARAM(SC_MAXIMIZE as _),
                 LPARAM(0),
             );
-            error_if_err!(res);
+            trace_result!(res);
         };
     }
 
@@ -180,7 +184,7 @@ impl Window {
                 LPARAM(0),
             )
         };
-        error_if_err!(res);
+        trace_result!(res);
     }
 
     pub fn is_invalid(&self) -> bool {
@@ -222,7 +226,7 @@ impl Monitor {
         };
 
         let success = unsafe { GetMonitorInfoW(self.handle, &mut info) };
-        error_if!(!success);
+        trace_result_b!(success);
         info.rcWork.into()
     }
 }
@@ -283,20 +287,14 @@ pub fn save_layout<A>(ctx: &Context<A>, monitor: Monitor, layout: Layout)
 where
     A: Allocator + Copy,
 {
-    // SAFETY: Context can't be used by miltiple threads so we only need to worry
-    // about outstanding references which do not exist because we do not give out any nor retain
-    // any.
-    let cache = unsafe { &mut *ctx.cache.get() };
-    cache.monitor_layouts.insert(monitor, layout);
+    ctx.cache.save_layout(monitor, layout);
 }
 
 pub fn layout_on<A>(ctx: &Context<A>, monitor: Monitor) -> Layout
 where
     A: Allocator + Copy,
 {
-    // SAFETY: See `save_layout` safety comment.
-    let cache = unsafe { &mut *ctx.cache.get() };
-    *cache.monitor_layouts.get(&monitor).unwrap_or(&Layout::None)
+    ctx.cache.layout_on(monitor)
 }
 
 pub fn get_monitor_with_window<A>(ctx: &Context<A>, window: Window) -> Monitor
@@ -304,16 +302,7 @@ where
     A: Allocator + Copy,
 {
     // SAFETY: See `save_layout` safety comment.
-    let cache = unsafe { &mut *ctx.cache.get() };
-    let queues = &cache.window_queues;
-
-    for (k, q) in queues.iter() {
-        if q.contains(&window) {
-            return *k;
-        }
-    }
-
-    Monitor::default()
+    ctx.cache.monitor_with_window(window)
 }
 
 pub(crate) fn get_monitor_with_window_live<A>(_ctx: &Context<A>, window: Window) -> Monitor
@@ -324,31 +313,18 @@ where
     Monitor { handle }
 }
 
-pub fn get_windows_on_monitor<A>(ctx: &Context<A>, monitor: Monitor) -> Vec<Window>
+pub fn get_windows_on_monitor<A>(ctx: &Context<A>, monitor: Monitor) -> Vec<Window, A>
 where
     A: Allocator + Copy,
 {
-    // SAFETY: See `save_layout` safety comment.
-    let cache = unsafe { &mut *ctx.cache.get() };
-    let queues = &cache.window_queues;
-    queues
-        .iter()
-        .find(|(m, _)| *m == monitor)
-        .unwrap_or(queues.front().unwrap())
-        .1
-        .iter()
-        .copied()
-        .collect()
+    ctx.cache.windows_on_monitor(ctx, monitor)
 }
 
-pub fn get_monitors<A>(ctx: &Context<A>) -> Vec<Monitor>
+pub fn get_monitors<A>(ctx: &Context<A>) -> Vec<Monitor, A>
 where
     A: Allocator + Copy,
 {
-    // SAFETY: See `save_layout` safety comment.
-    let cache = unsafe { &mut *ctx.cache.get() };
-    let queues = &cache.window_queues;
-    queues.iter().map(|(m, _)| m).copied().collect()
+    ctx.cache.monitors(ctx)
 }
 
 pub(crate) fn get_monitors_live<A: Allocator>(ctx: &Context<A>) -> Vec<Monitor, &Arena> {
@@ -373,24 +349,16 @@ pub(crate) fn get_monitors_live<A: Allocator>(ctx: &Context<A>) -> Vec<Monitor, 
             LPARAM(&mut monitors as *mut _ as isize),
         )
     };
-    error_if!(!success);
+    trace_result_b!(success);
 
     monitors
 }
 
-pub fn get_windows<A>(ctx: &Context<A>) -> Vec<Window>
+pub fn get_windows<A>(ctx: &Context<A>) -> Vec<Window, A>
 where
     A: Allocator + Copy,
 {
-    // SAFETY: See `save_layout` safety comment.
-    let cache = unsafe { &*ctx.cache.get() };
-    let queues = &cache.window_queues;
-    queues
-        .iter()
-        .map(|(_, q)| q.iter())
-        .flatten()
-        .copied()
-        .collect()
+    ctx.cache.windows(ctx)
 }
 
 pub(crate) fn get_windows_live<A>(ctx: &Context<A>) -> Vec<Window, &Arena>
@@ -405,8 +373,10 @@ where
                 cbSize: core::mem::size_of::<WINDOWINFO>() as u32,
                 ..Default::default()
             };
-            let res = GetWindowInfo(window, &mut info);
-            error_if_err!(res);
+
+            trace_result! {
+                GetWindowInfo(window, &mut info)
+            };
 
             if len != 0 && info.dwStyle.contains(WS_VISIBLE) && !info.dwStyle.contains(WS_POPUP) {
                 let dest_vec = lparam.0 as *mut Vec<Window, &Arena>;
@@ -437,13 +407,7 @@ pub fn get_focused_monitor<A>(ctx: &Context<A>) -> Monitor
 where
     A: Allocator + Copy,
 {
-    // SAFETY: See `save_layout` safety comment.
-    let cache = unsafe { &*ctx.cache.get() };
-    cache
-        .window_queues
-        .front()
-        .expect("there is at least one monitor")
-        .0
+    ctx.cache.focused_monitor()
 }
 
 pub(crate) fn get_focused_monitor_live() -> Monitor {
@@ -456,15 +420,7 @@ pub fn get_focused_window<A>(ctx: &Context<A>) -> Window
 where
     A: Allocator + Copy,
 {
-    // SAFETY: See `save_layout` safety comment.
-    let cache = unsafe { &*ctx.cache.get() };
-    *cache
-        .window_queues
-        .front()
-        .unwrap()
-        .1
-        .front()
-        .unwrap_or(&Window::default())
+    ctx.cache.focused_window()
 }
 
 pub(crate) fn get_focused_window_live() -> Window {
@@ -688,6 +644,14 @@ where
     }
 }
 
+pub fn focus_next_window(ctx: &Context) {
+    todo!()
+}
+
+pub fn focus_prev_window(ctx: &Context) {
+    todo!()
+}
+
 pub fn move_focus<A>(ctx: &Context<A>, direction: Direction)
 where
     A: Allocator + Copy,
@@ -734,7 +698,11 @@ where
     let scale = dpi_x as f64 / 96.0;
 
     match layout {
-        Layout::None => {}
+        Layout::None => {
+            for (out, cpy) in transformed_rects.iter_mut().zip(windows_rect.iter()) {
+                out.write(*cpy);
+            }
+        }
         Layout::Stack => {
             transform_rects_for_stack_uninit(
                 bounding_rect,
@@ -781,8 +749,16 @@ pub fn swap_or_send(window: Window, direction: Direction) {
     todo!()
 }
 
-pub fn swap_monitors(m1: Monitor, m2: Monitor) {
-    todo!()
+pub fn swap_monitors(ctx: &Context, m1: Monitor, m2: Monitor) {
+    let m1_windows = ctx.cache.windows_on_monitor(ctx, m1);
+    let m2_windows = ctx.cache.windows_on_monitor(ctx, m2);
+    for w in m1_windows {
+        send(ctx, w, m2);
+    }
+
+    for w in m2_windows {
+        send(ctx, w, m1);
+    }
 }
 
 pub fn get_adjacent_window<A>(ctx: &Context<A>, window: Window, direction: Direction) -> Window
@@ -868,7 +844,7 @@ pub fn kill_window(window: Window) {
     }
 
     let res = unsafe { PostMessageA(window.handle, WM_CLOSE, WPARAM(0), LPARAM(0)) };
-    error_if_err!(res);
+    trace_result!(res);
 }
 
 pub fn kill_all_windows<A>(ctx: &Context<A>)
@@ -878,6 +854,6 @@ where
     let windows = get_windows(ctx);
     for window in windows {
         let res = unsafe { PostMessageA(window.handle, WM_CLOSE, WPARAM(0), LPARAM(0)) };
-        error_if_err!(res);
+        trace_result!(res);
     }
 }
