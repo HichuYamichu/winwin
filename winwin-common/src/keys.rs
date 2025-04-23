@@ -123,6 +123,7 @@ pub enum Key {
     BackSlash,
 
     Unknown,
+    None
 }
 
 impl Key {

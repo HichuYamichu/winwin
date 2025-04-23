@@ -17,7 +17,7 @@ use winwin_common::{ClientEvent, SyncHandle};
 
 use windows::core::{s, PCSTR};
 
-use crate::{wm, Context, Input, KeyState, Monitor, Window};
+use crate::{wm, Context, GenericAlloc, Input, KeyState, Monitor, Window};
 pub use winwin_common::KBDelta;
 
 const THREAD_POOL_SIZE: usize = 2;
@@ -36,15 +36,16 @@ pub enum KeyboardOp {
     DoNothing,
 }
 
-pub enum Event<A: Allocator> {
-    KeyPress(Input<A>),
+pub enum Event {
+    KeyPress(Input),
     WindowOpen(Window, Monitor),
     WindowClose(Window, Monitor),
 }
 
-pub struct EventQueue {
+pub struct WindowManager<A: GenericAlloc> {
     client_event_rx: Receiver<ClientEvent>,
     keyboard_tx: SyncSender<KeyboardOp>,
+    ctx: Context<A>,
 
     // Used for shutdown and cleanup.
     iocp_handle: HANDLE,
@@ -52,10 +53,10 @@ pub struct EventQueue {
     hook_thread_id: u32,
 }
 
-impl EventQueue {
+impl<A: GenericAlloc> WindowManager<A> {
     // SAFETY: Caller must ensure that only one instance is created at a time.
     // It is safe to create another insance only after calling `shutdown` and waithing for it to finish.
-    pub unsafe fn new(ctx: &Context) -> Self {
+    pub unsafe fn new() -> Self {
         // NOTE: Buffer should be big enough to handle spontaneous bursts of events.
         let (tx, rx) = mpsc::sync_channel(128);
 
@@ -72,11 +73,13 @@ impl EventQueue {
         // This nonsense in necessary because Rust's ThreadId has nothing to do with actual thread id.
         let hook_thread_id = hook_thread_id_rx.recv().unwrap();
 
-        ctx.cache.fill(ctx);
+        let mut ctx = Context::new();
+        ctx.init_cache();
 
         Self {
             client_event_rx: rx,
             keyboard_tx: kb_tx,
+            ctx: todo!(),
 
             iocp_handle: *iocp,
             join_handles: [hook_thread_handle, pipe_server_handle],
@@ -84,47 +87,58 @@ impl EventQueue {
         }
     }
 
-    pub fn next_event<A>(&mut self, ctx: &Context<A>) -> Event<A>
+    pub fn ctx(&self) -> &Context<A> {
+        &self.ctx
+    }
+
+    pub fn ctx_mut(&mut self) -> &mut Context<A> {
+        &mut self.ctx
+    }
+
+    pub fn next_event(&mut self) -> Event
     where
         A: Allocator + Copy,
     {
         // We loop here because we don't want to return to user code on events that we can handle by ourselves.
         loop {
-            ctx.arena.reset();
+            self.ctx.alloc.arena.reset();
 
             let event = self.client_event_rx.recv().unwrap();
             match event {
                 ClientEvent::Keyboard(kb_delta) => {
-                    let input = ctx
+                    let input = self
+                        .ctx
                         .cache
-                        .update_input(ctx, kb_delta, self.keyboard_tx.clone());
+                        .update_input(kb_delta, self.keyboard_tx.clone());
                     return Event::KeyPress(input);
                 }
                 ClientEvent::WindowOpen(window_handle, monitor_handle) => {
                     let window = Window::from(window_handle);
                     let monitor = Monitor::from(monitor_handle);
-                    ctx.cache.add_window_to_queue(window, monitor);
+                    self.ctx.cache.add_window_to_queue(window, monitor);
                     return Event::WindowOpen(window, monitor);
                 }
                 ClientEvent::WindowClose(window_handle, monitor_handle) => {
                     let window = Window::from(window_handle);
                     let monitor = Monitor::from(monitor_handle);
-                    ctx.cache.remove_window_from_queue(window, monitor);
+                    self.ctx.cache.remove_window_from_queue(window, monitor);
                     return Event::WindowClose(window, monitor);
                 }
                 ClientEvent::WindowMonitorChanged(window_handle, monitor_handle) => {
                     let window = Window::from(window_handle);
-                    let monitor = Monitor::from(monitor_handle);
-                    ctx.cache.update_window_queue(monitor, window);
+                    let old_monitor = wm::monitor_with_window(&self.ctx, window);
+                    let new_monitor = Monitor::from(monitor_handle);
+                    self.ctx.cache.remove_window_from_queue(window, old_monitor);
+                    self.ctx.cache.add_window_to_queue(window, new_monitor);
                 }
                 ClientEvent::WindowFocusHanged(window_handle) => {
                     let window = Window::from(window_handle);
-                    let monitor = wm::get_monitor_with_window(ctx, window);
-                    ctx.cache.update_window_queue(monitor, window);
+                    let monitor = wm::monitor_with_window(&self.ctx, window);
+                    self.ctx.cache.update_queue_order(window, monitor);
                 }
                 ClientEvent::MonitorConnected(monitor_handle) => {
                     let monitor = Monitor::from(monitor_handle);
-                    ctx.cache.add_window_queue(monitor);
+                    self.ctx.cache.add_window_queue(monitor);
                 }
                 ClientEvent::MonitorDisconnected(monitor_handle) => {
                     // TODO: Entire cache has to be recomputed.

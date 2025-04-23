@@ -3,6 +3,12 @@ use winwin::*;
 
 fn main() {
     println!("Hello, world!");
+    // TODO:
+    // Reneme EventQueue to WindowManager
+    // Move context into WindowManager
+    // Put incoming events in ring buffer
+    // Relplace IOCP system with channel like ICP
+
 
     let subscriber = tracing_subscriber::fmt()
         .compact()
@@ -15,115 +21,116 @@ fn main() {
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let mod_key = Key::AltLeft;
-    let ctx = Context::new();
 
     // SAFETY: There can be only one `EventQueue` at a time.
-    let mut queue = unsafe { EventQueue::new(&ctx) };
+    let mut wm = unsafe { WindowManager::new() };
     loop {
-        let event = queue.next_event(&ctx);
+        let event = wm.next_event();
         match event {
             Event::KeyPress(input) => {
                 if input.all_pressed(&[mod_key, Key::X]) {
-                    queue.shutdown();
+                    wm.shutdown();
                     break;
                 }
 
                 // Focus switching.
                 if input.all_pressed(&[mod_key, Key::ShiftLeft, Key::J]) {
-                    focus_next_window(&ctx);
+                    focus_next_window(wm.ctx());
                 }
 
                 if input.all_pressed(&[mod_key, Key::ShiftLeft, Key::K]) {
-                    focus_prev_window(&ctx);
+                    focus_prev_window(wm.ctx());
                 }
 
                 // 2d window navigation.
                 if input.all_pressed(&[mod_key, Key::L]) {
-                    move_focus(&ctx, Direction::Right);
+                    move_focus(wm.ctx_mut(), Direction::Right);
                 }
 
                 if input.all_pressed(&[mod_key, Key::H]) {
-                    move_focus(&ctx, Direction::Left);
+                    move_focus(wm.ctx_mut(), Direction::Left);
                 }
 
                 if input.all_pressed(&[mod_key, Key::J]) {
-                    move_focus(&ctx, Direction::Down);
+                    move_focus(wm.ctx_mut(), Direction::Down);
                 }
 
                 if input.all_pressed(&[mod_key, Key::K]) {
-                    move_focus(&ctx, Direction::Up);
+                    move_focus(wm.ctx_mut(), Direction::Up);
                 }
 
                 // Swap adjacent windows.
                 if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::L]) {
-                    let window = get_focused_window(&ctx);
-                    swap_adjacent(&ctx, window, Direction::Right);
+                    let window = focused_window(wm.ctx());
+                    swap_adjacent(wm.ctx_mut(), window, Direction::Right);
                 }
 
                 if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::H]) {
-                    let window = get_focused_window(&ctx);
-                    swap_adjacent(&ctx, window, Direction::Left);
+                    let window = focused_window(wm.ctx());
+                    swap_adjacent(wm.ctx_mut(), window, Direction::Left);
                 }
 
                 if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::J]) {
-                    let window = get_focused_window(&ctx);
-                    swap_adjacent(&ctx, window, Direction::Down);
+                    let window = focused_window(wm.ctx());
+                    swap_adjacent(wm.ctx_mut(), window, Direction::Down);
                 }
 
                 if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::K]) {
-                    let window = get_focused_window(&ctx);
-                    swap_adjacent(&ctx, window, Direction::Up);
+                    let window = focused_window(wm.ctx());
+                    swap_adjacent(wm.ctx_mut(), window, Direction::Up);
                 }
 
                 // Apply selected layout.
                 if input.all_pressed(&[mod_key, Key::Q]) {
-                    let monitor = get_focused_monitor(&ctx);
-                    apply_layout(&ctx, monitor, Layout::Stack);
+                    let monitor = focused_monitor(wm.ctx());
+                    apply_layout(wm.ctx_mut(), monitor, Layout::Stack);
                 }
 
                 if input.all_pressed(&[mod_key, Key::W]) {
-                    let monitor = get_focused_monitor(&ctx);
-                    apply_layout(&ctx, monitor, Layout::Full);
+                    let monitor = focused_monitor(wm.ctx());
+                    apply_layout(wm.ctx_mut(), monitor, Layout::Full);
                 }
 
                 if input.all_pressed(&[mod_key, Key::E]) {
-                    let monitor = get_focused_monitor(&ctx);
-                    apply_layout(&ctx, monitor, Layout::Grid);
+                    let monitor = focused_monitor(wm.ctx());
+                    apply_layout(wm.ctx_mut(), monitor, Layout::Grid);
                 }
 
                 if input.all_pressed(&[mod_key, Key::R]) {
-                    let monitor = get_focused_monitor(&ctx);
-                    apply_layout(&ctx, monitor, Layout::None);
+                    let monitor = focused_monitor(wm.ctx());
+                    apply_layout(wm.ctx_mut(), monitor, Layout::None);
                 }
 
                 // Moving windows across monitors.
                 if input.all_pressed(&[mod_key, Key::Right]) {
-                    let window = get_focused_window(&ctx);
-                    let monitors = get_monitors(&ctx);
+                    let window = focused_window(wm.ctx());
+                    send_in(wm.ctx_mut(), window, Direction::Right);
+                }
 
-                    dbg!(window.title());
-                    send(&ctx, window, monitors[2]);
+                if input.all_pressed(&[mod_key, Key::Left]) {
+                    let window = focused_window(wm.ctx());
+                    send_in(wm.ctx_mut(), window, Direction::Left);
                 }
 
                 // Swap windows on monitors.
                 if input.all_pressed(&[mod_key, Key::P]) {
-                    let monitors = get_monitors(&ctx);
-                    swap_monitors(&ctx, monitors[0], monitors[2]);
+                    let monitors = monitors(wm.ctx());
+                    swap_monitors(wm.ctx_mut(), monitors[0], monitors[2]);
                 }
 
                 // Window closing.
                 if input.all_pressed(&[mod_key, Key::BackSlash]) {
-                    let window = get_focused_window(&ctx);
+                    let window = focused_window(wm.ctx());
                     kill_window(window);
                 }
 
                 if input.all_pressed(&[mod_key, Key::CtrlLeft, Key::BackSlash]) {
-                    kill_all_windows(&ctx);
+                    kill_all_windows(wm.ctx());
                 }
             }
             Event::WindowOpen(window, monitor) => {
-                let layout = layout_on(&ctx, monitor);
-                apply_layout(&ctx, monitor, layout);
+                let layout = layout_on(wm.ctx(), monitor);
+                apply_layout(wm.ctx_mut(), monitor, layout);
             }
             Event::WindowClose(window, monitor) => {
                 // By the time this event is handled the window in question might have been
@@ -132,8 +139,8 @@ fn main() {
                 // thus all `get_` functions called for this window will return default/invalid
                 // values.
                 // `monitor` value is valid and designates last monitor the window was on.
-                let layout = layout_on(&ctx, monitor);
-                apply_layout(&ctx, monitor, layout);
+                let layout = layout_on(wm.ctx(), monitor);
+                apply_layout(wm.ctx_mut(), monitor, layout);
             } // TODO: Handle monitor connection/disconection.
         }
     }
