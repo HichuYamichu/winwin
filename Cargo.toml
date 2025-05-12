@@ -3,5 +3,7 @@ resolver = "2"
 
 members = [
     "winwin",
-    "winwin-hooks", "winwin-common",
+    "winwin-hooks", 
+    "winwin-common",
 ]
+

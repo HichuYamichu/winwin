@@ -1,13 +1,19 @@
-use allocator_api2::alloc::AllocError;
-use allocator_api2::alloc::Allocator;
-use allocator_api2::alloc::Global as GlobalAllocator;
-use allocator_api2::vec::Vec;
-use std::cell::Cell;
+#![feature(allocator_api)]
+#![feature(get_mut_unchecked)]
+
+use std::alloc::Allocator;
+use std::alloc::Global;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::mem::MaybeUninit;
+use std::pin::Pin;
+use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::mpsc::SyncSender;
-use std::{alloc, ptr::NonNull};
+
+use hylib::alloc::ArenaRef;
+use hylib::alloc::{Arena, ArenaPin, ArenaPtr, GrowStrategy};
+use hylib::{KiB, MiB};
 
 pub use winwin_common::{Key, KeyState};
 
@@ -40,39 +46,36 @@ macro_rules! trace_result_b {
     };
 }
 
-pub struct Context<A: GenericAlloc = GlobalAllocator> {
-    alloc: AllocContext<A>,
+#[derive(Debug)]
+pub enum Error {
+    A,
+    B,
+}
+
+pub struct Context<A: Allocator = Global> {
+    arena: Pin<Rc<Arena>>,
+    persistent_arena: Arena,
+    user_allocator: A,
     cache: Cache,
+    errors: Option<Vec<Error, ArenaPin<Rc<Arena>>>>,
 }
 
-impl Context<GlobalAllocator> {
-    pub fn new() -> Self {
-        let arena = Arena::new_with_global_alloc();
-        let alloc = GlobalAllocator;
-        let cache = Cache::default();
+impl<A: Allocator> Context<A> {
+    pub fn new(alloc: A) -> Self {
+        let arena = Rc::pin(Arena::new(KiB(16), GrowStrategy::Chain));
 
-        Self {
-            alloc: AllocContext {
-                arena,
-                general: alloc,
+        let persistent_arena: Arena = Arena::new(
+            MiB(64),
+            GrowStrategy::ReserveCommit {
+                commit_size: KiB(16),
             },
-            cache: cache,
-        }
-    }
-}
+        );
 
-pub trait GenericAlloc: Allocator + Copy {}
-impl<T: Allocator + Copy> GenericAlloc for T {}
+        let mut cache = Cache::default();
 
-pub struct AllocContext<A: GenericAlloc = GlobalAllocator> {
-    arena: Arena,
-    general: A,
-}
+        let monitors = monitors_ex(&*arena, &cache);
+        let windows = windows_ex(&*arena, &cache);
 
-impl<A: GenericAlloc> Context<A> {
-    pub fn init_cache(&mut self) {
-        let monitors = monitors_live(self);
-        let windows = windows_live(self);
         let mut window_queues = VecDeque::new();
         for monitor in monitors {
             let queue = windows
@@ -85,131 +88,50 @@ impl<A: GenericAlloc> Context<A> {
         }
         drop(windows);
 
-        self.cache.window_queues = window_queues;
-    }
-}
+        cache.window_queues = window_queues;
 
-pub struct Arena {
-    mem: NonNull<u8>,
-    end: Cell<usize>,
-    used: Cell<usize>,
-    capacity: usize,
-}
+        let errors_alloc = ArenaPin(arena.clone());
+        let errors = Some(Vec::new_in(errors_alloc));
 
-impl Arena {
-    pub fn new_with_global_alloc() -> Self {
-        // Reserve 4GB, commit as needed.
-        let size = u32::MAX as usize;
-        let layout = alloc::Layout::array::<u8>(size).expect("arguments are correct");
-        let mem = unsafe { alloc::alloc(layout) };
-        let mem = NonNull::new(mem).expect("global alloc should not fail");
-
-        Arena {
-            mem,
-            end: Cell::new(0),
-            used: Cell::new(0),
-            capacity: size,
+        Self {
+            arena,
+            persistent_arena,
+            user_allocator: alloc,
+            cache,
+            errors,
         }
     }
 
-    pub fn reset(&mut self) {
-        self.end.set(0);
-        self.used.set(0);
-    }
+    fn reset(&mut self) {
+        // Errors must be dropped because their underlying allocator is being reset.
+        let _ = self.errors.take();
+        let mut pinned = Pin::into_inner(self.arena.clone());
 
-    pub fn slice_uninit<'a, T: Sized>(&'a self, size: usize) -> &'a [MaybeUninit<T>] {
-        let layout = alloc::Layout::array::<T>(size).unwrap();
-        let ptr = self.allocate(layout).unwrap();
-        let s = unsafe { std::slice::from_raw_parts(ptr.cast().as_ptr(), size) };
-        s
-    }
-
-    pub fn slice_mut_uninit<'a, T: Sized>(&'a self, size: usize) -> &'a mut [MaybeUninit<T>] {
-        let layout = alloc::Layout::array::<T>(size).unwrap();
-        let ptr = self.allocate(layout).unwrap();
-        let s = unsafe { std::slice::from_raw_parts_mut(ptr.cast().as_ptr(), size) };
-        s
-    }
-}
-
-impl Drop for Arena {
-    fn drop(&mut self) {
-        let layout = alloc::Layout::array::<u8>(self.capacity).expect("arguments are correct");
-        unsafe { alloc::dealloc(self.mem.as_ptr(), layout) };
-    }
-}
-
-unsafe impl Allocator for &Arena {
-    fn allocate(&self, layout: alloc::Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: see: https://doc.rust-lang.org/std/rc/struct.Rc.html#method.get_mut_unchecked
+        // At this point exactly 2 `Rc`s exist, the original `self.arena` is not dereferenced nor borrowed for the duration returened reference is used.
         unsafe {
-            let end = self.end.get();
-            let curr_ptr = self.mem.as_ptr().add(end);
-            let size = layout.size();
-            let align = layout.align();
-
-            let offset = curr_ptr.align_offset(align);
-            if offset == usize::MAX || end + offset + size > self.capacity {
-                return Err(AllocError);
-            }
-
-            let aligned_ptr = curr_ptr.add(offset);
-            self.end.set(end + offset + size);
-            self.used.set(self.used.get() + size);
-
-            Ok(NonNull::slice_from_raw_parts(
-                NonNull::new_unchecked(aligned_ptr),
-                size,
-            ))
-        }
-    }
-
-    unsafe fn deallocate(&self, _ptr: NonNull<u8>, layout: alloc::Layout) {
-        // Once all allocations are freed we reset this arena.
-        let size = layout.size();
-        self.used.set(self.used.get() - size);
-
-        if self.used.get() == 0 {
-            self.end.set(0);
-        }
-    }
-}
-
-pub trait FromIteratorWithAlloc<T, A: Allocator>: Sized {
-    fn from_iter_with_alloc<I: IntoIterator<Item = T>>(iter: I, alloc: A) -> Self;
-}
-
-impl<T, A: Allocator> FromIteratorWithAlloc<T, A> for Vec<T, A> {
-    fn from_iter_with_alloc<I: IntoIterator<Item = T>>(iter: I, alloc: A) -> Self {
-        let iter = iter.into_iter();
-        let mut my_vec = Vec::with_capacity_in(iter.size_hint().0, alloc);
-
-        for item in iter {
-            my_vec.push(item);
+            debug_assert!(Rc::strong_count(&pinned) == 2);
+            Rc::get_mut_unchecked(&mut pinned).reset();
         }
 
-        my_vec
+        let errors_alloc = ArenaPin(self.arena.clone());
+        let errors = Some(Vec::new_in(errors_alloc));
+
+        self.errors = errors;
     }
 }
 
-pub trait IteratorCollectWithAlloc: Iterator {
-    fn collect_with<T, A, C>(self, alloc: A) -> C
-    where
-        Self: Sized + IntoIterator<Item = T>,
-        C: FromIteratorWithAlloc<T, A>,
-        A: Allocator,
-    {
-        C::from_iter_with_alloc(self, alloc)
-    }
-}
-
-impl<I: Iterator> IteratorCollectWithAlloc for I {}
-
-// TODO: Add Allocator bound to cache containers once it stabilizes.
 #[derive(Default)]
 pub struct Cache {
     key_map: KeyMap,
     monitor_layouts: HashMap<Monitor, Layout>,
     window_queues: VecDeque<(Monitor, VecDeque<Window>)>,
+
+    // monitors: Vec<Monitor>,
+    // layouts: Vec<Layout>,
+    // windows: Vec<Window>,
+    // window_data: Vec<WindowData>,
+    // window_queues: Vec<VecDeque<Window>>,
 }
 
 impl Cache {
@@ -321,7 +243,7 @@ impl Cache {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct KeyMap {
     keys: [u32; 8],
 }
@@ -351,7 +273,7 @@ impl KeyMap {
             let idx = i / 32;
             let bit = i % 32;
             if self.keys[idx] & (1 << bit) != 0 {
-                if slot > 10 {
+                if slot < 10 {
                     input.keys[slot] = Key::from_vk_code(i as u8);
                     slot += 1;
                 }
