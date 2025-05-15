@@ -368,7 +368,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "win-channel"
 version = "0.1.0"
-source = "git+https://github.com/HichuYamichu/win-channel#0e2a990ca5585bd74849b40c6862bc95eb51afae"
+source = "git+https://github.com/HichuYamichu/win-channel#645977d35cd2f2b085c9c26326437f5595e07140"
 dependencies = [
  "windows 0.60.0",
 ]
@@ -575,6 +575,7 @@ dependencies = [
 name = "winwin"
 version = "0.1.0"
 dependencies = [
+ "crossbeam",
  "hylib",
  "serde",
  "tracing",

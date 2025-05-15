@@ -1,35 +1,29 @@
 use std::alloc::Allocator;
-use std::sync::mpsc::{self, sync_channel};
-use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::Mutex;
+use std::os::windows::io::AsRawHandle;
+use std::sync::{OnceLock, RwLock};
 use std::thread::JoinHandle;
 use std::thread::{self};
+use windows::core::{s, w};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows::Win32::System::Threading::*;
+use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use winwin_common::ClientEvent;
 
-use windows::core::{s, w};
+use crossbeam::channel::{self, select, Receiver, Sender};
 
-use win_channel::{Config, Receiver as IPCReceiver, Sender as IPCSender};
+use crate::error::*;
+use crate::input::*;
+use crate::types::*;
+use crate::wm;
+use crate::Context;
 
-use crate::{wm, Context, Input, KeyState, Monitor, Window};
-pub use winwin_common::KBDelta;
+static WIN_EVENT_TX: OnceLock<RwLock<Option<Sender<WinEvent>>>> = OnceLock::new();
+static KEYBOARD_HANDLER: OnceLock<RwLock<Option<KeyboardHandler>>> = OnceLock::new();
 
-const IPC_CHANNEL_SIZE: usize = 128;
-
-const IPC_CONFIG: Config = Config {
-    shmem_name: w!("winwin_shmem"),
-    send_event_name: w!("winwin_send_event"),
-    recv_event_name: w!("winwin_recv_event"),
-    disconnect_event_name: w!("winwin_disconnect_event"),
-};
-
-#[link(name = "hooks.dll", kind = "dylib")]
-extern "system" {
-    fn cbt_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
-    fn shell_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
+struct KeyboardHandler {
+    sender: Sender<KBDelta>,
+    receiver: Receiver<KeyboardOp>,
 }
 
 pub enum KeyboardOp {
@@ -37,170 +31,166 @@ pub enum KeyboardOp {
     DoNothing,
 }
 
+enum WinEvent {
+    WindowCreate { window: WindowHandle },
+    WindowDestroy { window: WindowHandle },
+    // WindowMonitorChanged(usize, usize),
+    // WindowFocusHanged(usize),
+    // MonitorConnected(usize),
+    // MonitorDisconnected(usize),
+}
+
 #[derive(Debug)]
 pub enum Event {
     KeyPress(Input),
-    WindowOpen(Window, Monitor),
-    WindowClose(Window, Monitor),
+    WindowCreate(Window),
+    WindowDestroy(Window),
 }
 
 pub struct WindowManager {
-    client_event_rx: IPCReceiver<ClientEvent, { IPC_CHANNEL_SIZE }>,
-    keyboard_ack_tx: SyncSender<KeyboardOp>,
+    win_event_hooks: Vec<HWINEVENTHOOK>,
+    keyboard_hook: HHOOK,
+    msg_loop_thread_handle: JoinHandle<()>,
 
-    // Used for shutdown and cleanup.
-    hook_thread_handle: JoinHandle<()>,
-    hook_thread_id: u32,
+    win_event_rx: Receiver<WinEvent>,
+    keyboard_delta_rx: Receiver<KBDelta>,
+    keyboard_op_tx: Sender<KeyboardOp>,
 }
 
 impl WindowManager {
     // SAFETY: Caller must ensure that only one instance is created at a time.
     // It is safe to create another insance only after calling `shutdown` and waithing for it to finish.
     pub unsafe fn new() -> Self {
-        let client_event_rx =
-            IPCReceiver::<ClientEvent, IPC_CHANNEL_SIZE>::new(IPC_CONFIG).unwrap();
-        let keyboard_hook_tx = IPCSender::<ClientEvent, IPC_CHANNEL_SIZE>::new(IPC_CONFIG).unwrap();
+        let (win_event_tx, win_event_rx) = channel::bounded(100);
+        WIN_EVENT_TX.set(RwLock::new(Some(win_event_tx)));
 
-        let (keyboard_ack_tx, keyboard_ack_rx) = mpsc::sync_channel(0);
-        let (hook_thread_id_tx, hook_thread_id_rx) = sync_channel(0);
+        let (keyboard_delta_tx, keyboard_delta_rx) = channel::bounded(10);
+        let (keyboard_op_tx, keyboard_op_rx) = channel::bounded(0);
 
-        let hook_thread_handle = thread::spawn(move || unsafe {
-            hook_thread_id_tx
-                .send(GetCurrentThreadId())
-                .expect("main thread is waiting for this id");
+        let keyboard_handler = KeyboardHandler {
+            sender: keyboard_delta_tx,
+            receiver: keyboard_op_rx,
+        };
+        KEYBOARD_HANDLER.set(RwLock::new(Some(keyboard_handler)));
 
-            install_hooks(keyboard_hook_tx, keyboard_ack_rx);
+        let mut win_event_hooks = Vec::new();
+        let events = [(EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY)];
+        for (ev_min, ev_max) in events {
+            let hook = unsafe {
+                SetWinEventHook(
+                    ev_min,
+                    ev_max,
+                    None,
+                    Some(win_event_hook_proc),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                )
+            };
+
+            win_event_hooks.push(hook);
+        }
+
+        let keyboard_hook = unsafe {
+            SetWindowsHookExA(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), None, 0).unwrap()
+        };
+
+        let msg_loop_thread_handle = thread::spawn(move || unsafe {
+            let mut msg = MSG::default();
+            if GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         });
 
-        // This nonsense in necessary because Rust's ThreadId has nothing to do with actual thread id.
-        let hook_thread_id = hook_thread_id_rx.recv().unwrap();
-
         Self {
-            client_event_rx,
-            keyboard_ack_tx,
+            win_event_hooks,
+            keyboard_hook,
+            msg_loop_thread_handle,
 
-            hook_thread_handle,
-            hook_thread_id,
+            win_event_rx,
+            keyboard_delta_rx,
+            keyboard_op_tx,
         }
     }
 
     pub fn next_event<A: Allocator + Copy>(&mut self, ctx: &mut Context<A>) -> Event {
         // We loop here because we don't want to return to user code on events that we can handle by ourselves.
         loop {
-            for e in ctx.errors.iter() {
-                dbg!(e);
-            }
-            ctx.reset();
+            select! {
+                recv(self.win_event_rx) -> event => {
+                    match event {
+                        Ok(WinEvent::WindowCreate { window }) => {
+                            if let Ok(w) = ctx.register_window(window) {
+                                return Event::WindowCreate(w);
+                            }
+                        }
+                        Ok(WinEvent::WindowDestroy { window }) => {
+                            let w = todo!();
+                            return Event::WindowDestroy(w);
+                        },
+                        _ => {}
+                   }
+                },
+                recv(self.keyboard_delta_rx) -> kb_delta => {
+                    match kb_delta {
+                        Ok(kb_delta) => {
+                            ctx.update_input(kb_delta);
+                            let input = ctx.input(self.keyboard_op_tx.clone());
+                            return Event::KeyPress(input);
+                        },
+                        Err(_) => {}
 
-            // SAFETY: This is the only receiver so long the user upheld safety requirements of `new`.
-            let event = unsafe { self.client_event_rx.recv().unwrap() };
-
-            match event {
-                ClientEvent::Keyboard(kb_delta) => {
-                    let input = ctx
-                        .cache
-                        .update_input(kb_delta, self.keyboard_ack_tx.clone());
-                    return Event::KeyPress(input);
+                    }
                 }
-                ClientEvent::WindowOpen(window_handle, monitor_handle) => {
-                    let window = Window::from(window_handle);
-                    let monitor = Monitor::from(monitor_handle);
-                    ctx.cache.add_window_to_queue(window, monitor);
-                    return Event::WindowOpen(window, monitor);
-                }
-                ClientEvent::WindowClose(window_handle, monitor_handle) => {
-                    let window = Window::from(window_handle);
-                    let monitor = Monitor::from(monitor_handle);
-                    ctx.cache.remove_window_from_queue(window, monitor);
-                    return Event::WindowClose(window, monitor);
-                }
-                ClientEvent::WindowMonitorChanged(window_handle, monitor_handle) => {
-                    let window = Window::from(window_handle);
-                    let old_monitor = wm::monitor_with_window(ctx, window);
-                    let new_monitor = Monitor::from(monitor_handle);
-                    ctx.cache.remove_window_from_queue(window, old_monitor);
-                    ctx.cache.add_window_to_queue(window, new_monitor);
-                }
-                ClientEvent::WindowFocusHanged(window_handle) => {
-                    let window = Window::from(window_handle);
-                    let monitor = wm::monitor_with_window(ctx, window);
-                    ctx.cache.update_queue_order(window, monitor);
-                }
-                ClientEvent::MonitorConnected(monitor_handle) => {
-                    let monitor = Monitor::from(monitor_handle);
-                    ctx.cache.add_window_queue(monitor);
-                }
-                ClientEvent::MonitorDisconnected(_monitor_handle) => {
-                    // TODO: Entire cache has to be recomputed.
-                }
-            }
+            };
         }
     }
 
-    // `shutdown` must be called explicitly before application can exit.
     pub fn shutdown(self) {
         unsafe {
-            // This will unblock `install_hooks` thread which cleans up after itself.
-            let _ = PostThreadMessageA(self.hook_thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+            let h = HANDLE(self.msg_loop_thread_handle.as_raw_handle() as _);
+            let thread_id = GetThreadId(h);
+            PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
         }
-        let _ = self.hook_thread_handle.join();
         tracing::trace!("shutdown done");
     }
 }
 
-unsafe fn install_hooks(tx: IPCSender<ClientEvent, IPC_CHANNEL_SIZE>, rx: Receiver<KeyboardOp>) {
-    let mut kb_handler_guard = KB_HANDLER.lock().unwrap();
-    *kb_handler_guard = Some(KeyboardHandler::new(tx, rx));
-    drop(kb_handler_guard);
-
-    let main_h_instance: HINSTANCE = GetModuleHandleA(None)
-        .expect("loading handle to current exe should always succseed")
-        .into();
-    let kb_hook = SetWindowsHookExA(
-        WH_KEYBOARD_LL,
-        Some(low_level_keyboard_proc),
-        Some(main_h_instance),
-        0,
-    )
-    .unwrap();
-
-    let dll_name = s!("hooks.dll");
-    let h_instance: HINSTANCE = GetModuleHandleA(dll_name)
-        .expect("required dll has to be loaded at this point")
-        .into();
-
-    let cbt_hook = SetWindowsHookExA(WH_CBT, Some(cbt_proc), Some(h_instance), 0).unwrap();
-    let shell_hook = SetWindowsHookExA(WH_SHELL, Some(shell_proc), Some(h_instance), 0).unwrap();
-
-    // GetMessageA will return once PostThreadMessageA in `EventQueue::shutdown` posts a message.
-    let mut msg = MSG::default();
-    let _ = GetMessageA(&mut msg as *mut _, None, 0, 0);
-
-    let _ = UnhookWindowsHookEx(kb_hook);
-    let _ = UnhookWindowsHookEx(cbt_hook);
-    let _ = UnhookWindowsHookEx(shell_hook);
-
-    let mut kb_handler_guard = KB_HANDLER.lock().unwrap();
-    let kb_handler = kb_handler_guard.take();
-    drop(kb_handler);
-
-    tracing::trace!("hooks unloaded");
-}
-
-static KB_HANDLER: Mutex<Option<KeyboardHandler>> = Mutex::new(None);
-
-struct KeyboardHandler {
-    sender: IPCSender<ClientEvent, IPC_CHANNEL_SIZE>,
-    receiver: Receiver<KeyboardOp>,
-}
-
-impl KeyboardHandler {
-    fn new(tx: IPCSender<ClientEvent, IPC_CHANNEL_SIZE>, rx: Receiver<KeyboardOp>) -> Self {
-        Self {
-            sender: tx,
-            receiver: rx,
-        }
+unsafe extern "system" fn win_event_hook_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
+) {
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    let is_window_event = id_object == OBJID_WINDOW.0 && id_child == 0 && hwnd != HWND::default();
+    if !is_window_event {
+        return;
     }
+
+    let win_event = match event {
+        EVENT_OBJECT_CREATE => WinEvent::WindowCreate {
+            window: WindowHandle::from(hwnd),
+        },
+        EVENT_OBJECT_DESTROY => WinEvent::WindowDestroy {
+            window: WindowHandle::from(hwnd),
+        },
+        _ => return,
+    };
+
+    let lock = WIN_EVENT_TX
+        .get()
+        .expect("OnceLock must be set up at this point");
+    let guard = lock.read().expect("mutex is not poisoned");
+    let tx = guard
+        .as_ref()
+        .expect("channel was set up and not cleaned up yet");
+
+    tx.send(win_event);
 }
 
 unsafe extern "system" fn low_level_keyboard_proc(
@@ -215,22 +205,26 @@ unsafe extern "system" fn low_level_keyboard_proc(
             key_state: KeyState::from(wparam),
         };
 
-        let event = ClientEvent::Keyboard(kb_delta);
-        let kb_handler_guard = KB_HANDLER.lock().unwrap();
-        if let Some(ref kb_handler) = kb_handler_guard.as_ref() {
-            let tx = &kb_handler.sender;
-            let rx = &kb_handler.receiver;
+        let lock = KEYBOARD_HANDLER
+            .get()
+            .expect("OnceLock must be set up at this point");
+        let guard = lock.read().expect("mutex is not poisoned");
+        let kb_handler = guard
+            .as_ref()
+            .expect("channel was set up and not cleaned up yet");
 
-            tx.send(event)
-                .expect("main thread must still be around at this point");
+        let tx = &kb_handler.sender;
+        let rx = &kb_handler.receiver;
 
-            let op = rx
-                .recv()
-                .expect("hook thread must still be around at this point");
+        tx.send(kb_delta)
+            .expect("main thread must still be around at this point");
 
-            if matches!(op, KeyboardOp::InterceptKeypress) {
-                return LRESULT(-1);
-            }
+        let op = rx
+            .recv()
+            .expect("hook thread must still be around at this point");
+
+        if matches!(op, KeyboardOp::InterceptKeypress) {
+            return LRESULT(-1);
         }
     }
 
