@@ -13,8 +13,8 @@ impl From<RECT> for Rect {
         Self {
             x: r.left,
             y: r.top,
-            width: r.right - r.left,
-            height: r.bottom - r.top,
+            width: r.right - r.left + 1,  // Make `Rect` inclusive.
+            height: r.bottom - r.top + 1, // Make `Rect` inclusive.
         }
     }
 }
@@ -35,8 +35,8 @@ impl From<Rect> for RECT {
         RECT {
             top: val.y,
             left: val.x,
-            bottom: val.y + val.height,
-            right: val.x + val.width,
+            bottom: val.y + val.height - 1, // Make `RECT` exclusive.
+            right: val.x + val.width -1, // Make `RECT` exclusive.
         }
     }
 }
@@ -125,6 +125,12 @@ pub struct Window {
     pub(crate) generation: usize,
 }
 
+impl Window {
+    pub(crate) fn new(index: usize, generation: usize) -> Self {
+        Self { index, generation }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct MonitorHandle {
     handle: usize,
@@ -150,6 +156,12 @@ pub struct Monitor {
     pub(crate) generation: usize,
 }
 
+impl Monitor {
+    pub(crate) fn new(index: usize, generation: usize) -> Self {
+        Self { index, generation }
+    }
+}
+
 #[derive(Default, Clone, Copy, Debug)]
 pub enum Layout {
     #[default]
@@ -159,3 +171,9 @@ pub enum Layout {
     Full,
 }
 
+#[derive(Default, Clone, Copy, Debug)]
+pub struct WindowAttributes {
+    // TODO: Use bits.
+    pub minimized: bool,
+    pub floating: bool
+}

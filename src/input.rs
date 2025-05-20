@@ -1,7 +1,7 @@
 use crossbeam::channel::Sender;
 use windows::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
 
-use crate::{events::KeyboardOp};
+use crate::events::KeyboardOp;
 
 #[derive(Debug)]
 pub struct KBDelta {
@@ -169,9 +169,9 @@ pub enum Key {
     VK_F23 = 0x86,
     VK_F24 = 0x87,
     VK_NUMLOCK = 0x90,
-    VK_LSHIFT = 0xA0,
+    ShiftLeft = 0xA0,
     VK_RSHIFT = 0xA1,
-    VK_LCONTROL = 0xA2,
+    CtrlLeft = 0xA2,
     VK_RCONTROL = 0xA3,
     AltLeft = 0xA4,
     AltRight = 0xA5,
@@ -225,12 +225,6 @@ impl From<u8> for Key {
     }
 }
 
-impl Key {
-    pub fn to_vk_code() {
-        todo!()
-    }
-}
-
 #[derive(Debug)]
 pub struct Input {
     keys: [u32; 8],
@@ -271,7 +265,8 @@ impl Input {
             let idx = (vk_code / 32) as usize;
             let bit = vk_code % 32;
             let value = self.keys[idx] & (1 << bit);
-            value == 1
+            value != 0
         })
     }
 }
+
