@@ -1,4 +1,57 @@
+use std::collections::VecDeque;
+
 use windows::Win32::{Foundation::*, Graphics::Gdi::HMONITOR, UI::WindowsAndMessaging::*};
+
+use crate::input::{KBDelta, KeyState};
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum Slot {
+    Vaccant { next: Option<usize> },
+    Occupied,
+}
+
+#[derive(Debug, Default)]
+pub struct State {
+    pub(crate) monitor_handles: Vec<MonitorHandle>,
+    pub(crate) monitor_layouts: Vec<Layout>,
+    pub(crate) monitor_windows: Vec<VecDeque<Window>>,
+    pub(crate) monitor_rects: Vec<Rect>,
+    pub(crate) monitor_generations: Vec<usize>,
+    pub(crate) monitor_slots: Vec<Slot>,
+    pub(crate) monitor_free_idx: Option<usize>,
+
+    pub(crate) window_handles: Vec<WindowHandle>,
+    pub(crate) window_rects: Vec<Rect>,
+    pub(crate) window_titles: Vec<String>,
+    pub(crate) window_monitor: Vec<Monitor>,
+    pub(crate) window_attributes: Vec<WindowAttributes>,
+    pub(crate) window_generations: Vec<usize>,
+    pub(crate) window_slots: Vec<Slot>,
+    pub(crate) window_free_idx: Option<usize>,
+
+    pub(crate) focused_monitor: Monitor,
+    pub(crate) focused_window: Option<Window>,
+}
+
+#[derive(Default, Debug)]
+pub struct KeyMap {
+    pub(crate) keys: [u32; 8],
+}
+
+impl KeyMap {
+    pub fn update(&mut self, kb_delta: KBDelta) {
+        let idx = (kb_delta.vk_code / 32) as usize;
+        let bit = kb_delta.vk_code % 32;
+        match kb_delta.key_state {
+            KeyState::Up => {
+                self.keys[idx] &= !(1 << bit);
+            }
+            KeyState::Down => {
+                self.keys[idx] |= 1 << bit;
+            }
+        }
+    }
+}
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct Rect {
@@ -36,7 +89,7 @@ impl From<Rect> for RECT {
             top: val.y,
             left: val.x,
             bottom: val.y + val.height - 1, // Make `RECT` exclusive.
-            right: val.x + val.width -1, // Make `RECT` exclusive.
+            right: val.x + val.width - 1,   // Make `RECT` exclusive.
         }
     }
 }
@@ -175,5 +228,5 @@ pub enum Layout {
 pub struct WindowAttributes {
     // TODO: Use bits.
     pub minimized: bool,
-    pub floating: bool
+    pub floating: bool,
 }

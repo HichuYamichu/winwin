@@ -219,12 +219,6 @@ pub enum Key {
     VK_OEM_CLEAR = 0xFE,
 }
 
-impl From<u8> for Key {
-    fn from(n: u8) -> Self {
-        todo!()
-    }
-}
-
 #[derive(Debug)]
 pub struct Input {
     keys: [u32; 8],
@@ -269,4 +263,3 @@ impl Input {
         })
     }
 }
-

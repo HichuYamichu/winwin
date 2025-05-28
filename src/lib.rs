@@ -7,9 +7,9 @@ pub mod input;
 pub mod types;
 pub mod wm;
 
-pub mod context;
-pub use context::*;
-pub use events::WindowManager;
+pub use events::*;
+pub use input::Key;
+pub use types::*;
 
 #[macro_export]
 macro_rules! map_err {

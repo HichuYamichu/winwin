@@ -1,9 +1,6 @@
 use tracing::Level;
-use winwin::events::Event;
-use winwin::input::Key;
-use winwin::types::Layout;
-use winwin::wm::*;
-use winwin::*;
+
+use winwin::{try_or_bail, wm::*, Event, EventQueue, Key, Layout};
 
 fn main() {
     let subscriber = tracing_subscriber::fmt()
@@ -18,9 +15,8 @@ fn main() {
 
     let mod_key = Key::AltLeft;
 
-    // Creating more than one `WindowManager` at a time will panic.
-    let mut wm = WindowManager::new();
-    let ctx = &mut Context::new();
+    // Creating more than one `EventQueue` at a time will panic.
+    let (mut queue, ref mut ctx) = EventQueue::new();
 
     // TODO: rewrite this:
 
@@ -35,31 +31,33 @@ fn main() {
     let _ = apply_layout(ctx, m, Layout::Stack);
 
     loop {
-        let event = wm.next_event(ctx); // Wait for next event to handle.
+        let event = queue.next_event(ctx); // Wait for next event to handle.
         match event {
             // `Input` structure allows us to check what keys are pressed. It is strongly
             // recommended to use input ASAP since it contains a rendezvous channel used to notify
             // the keyboard handler that a keypress should be intercepted and not passed further.
             // If you don't want to intercept a key press, use `pressed_no_intercept` instead of
-            // `pressed`. Moreover, it should be noted that only the last key that completes the
-            // sequence will be intercepted. This is because, for example, we don't know if the
-            // user is going to press X after ALT, so we can't intercept the ALT press.
+            // `pressed`.
             Event::KeyPress(input) if input.pressed(&[mod_key, Key::X]) => {
-                wm.shutdown();
+                queue.shutdown();
                 break;
             }
 
             // Layouts.
             Event::KeyPress(input) if input.pressed(&[mod_key, Key::Q]) => {
                 // Set stack layout on currently focused monitor.
-                // let monitor = focused_monitor(ctx);
-                // let _ = apply_layout(ctx, monitor, Layout::Stack);
+                let monitor = focused_monitor(ctx);
+                let _ = apply_layout(ctx, monitor, Layout::Stack);
             }
             Event::KeyPress(input) if input.pressed(&[mod_key, Key::W]) => {
                 // Set full layout on currently focused monitor.
+                let monitor = focused_monitor(ctx);
+                let _ = apply_layout(ctx, monitor, Layout::Full);
             }
             Event::KeyPress(input) if input.pressed(&[mod_key, Key::E]) => {
                 // Set grid layout on currently focused monitor.
+                let monitor = focused_monitor(ctx);
+                let _ = apply_layout(ctx, monitor, Layout::Grid);
             }
 
             // Order based navigation.
@@ -115,7 +113,7 @@ fn main() {
                 let layout = try_or_bail!(layout_on(ctx, m));
                 apply_layout(ctx, m, layout);
             }
-            Event::WindowDestroy(_window, monitor) => {
+            Event::WindowDestroy { monitor, .. } => {
                 // When this event is signaled the window has already been evicted from the
                 // internal cache, it is only returned in case you maintain your own collection
                 // with windows in it. `monitor` param is the monitor the window was on before its
@@ -123,17 +121,25 @@ fn main() {
                 let layout = try_or_bail!(layout_on(ctx, monitor));
                 apply_layout(ctx, monitor, layout);
             }
-            Event::WindowMove {
+            Event::WindowMoveOrResize {
                 window,
                 old_rect,
                 new_rect,
+                old_monitor,
+                new_monitor,
             } => {
-                // TODO: if window intersects a lot with other window swap them.
+                // You can check `Rect` coordinates and sizes to figure out if this window moved or
+                // was resized (or both). `old_monitor` and `new_monitor` will be the same if
+                // window did not change monitors.
 
                 tracing::debug!("move");
             }
-            Event::WindowResize { .. } => {
-                tracing::debug!("resize");
+            // This event is signaled only when you change the focus manually, that is: by means
+            // other then opening a new window or closing the old one, in these cases WindowCreate
+            // and WindowDestroy events are fired.
+            Event::WindowFocusChange(window) => {
+                let name = try_or_bail!(window_title(ctx, window));
+                tracing::debug!(name);
             }
         }
     }
